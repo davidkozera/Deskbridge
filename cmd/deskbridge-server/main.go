@@ -82,6 +82,9 @@ type session struct {
 	quality atomic.Int32
 	audioOn atomic.Bool
 	clipOn  atomic.Bool
+	videoOn atomic.Bool   // client wants motion sent as video
+	codecs  atomic.Uint32 // which video codecs the client can decode
+	restart atomic.Bool   // the client asked for a fresh video stream
 	done    chan struct{}
 	once    sync.Once
 }
@@ -488,12 +491,18 @@ func inputLoop(s *session, peer clipPeer) {
 			s.quality.Store(int32(p[1]))
 			s.audioOn.Store(p[2] != 0)
 			allowSleep.Store(p[3] != 0)
+			if len(p) >= 7 {
+				s.videoOn.Store(p[5] != 0)
+				s.codecs.Store(uint32(p[6]))
+			}
 			if len(p) >= 5 {
 				s.clipOn.Store(p[4] != 0)
 				if workerMode {
 					clipRelayState(clipEnabled())
 				}
 			}
+		case proto.MsgVideoRestart:
+			s.restart.Store(true)
 		case proto.MsgMouseMove:
 			if len(p) < 4 {
 				continue
@@ -647,6 +656,8 @@ func videoLoop(s *session) {
 	defer c.free()
 	desk := newDeskState()
 	var prev []byte
+	vid := newMotionVideo(s)
+	defer vid.close()
 	sem := make(chan struct{}, runtime.NumCPU())
 	u16 := func(v int) []byte { return binary.LittleEndian.AppendUint16(nil, uint16(v)) }
 
@@ -692,6 +703,33 @@ func videoLoop(s *session) {
 		}
 
 		rects := proto.DirtyRects(c.pix, prev, c.w, c.h, 64)
+		switch vid.decide(rects, c.w, c.h, prev == nil, interval, quality) {
+		case leaveVideo:
+			vid.markForRedraw(prev, c.w) // the next pass redraws, crisply, what video drew
+			continue
+		case useVideo:
+			if len(rects) > 0 {
+				sent, err := vid.send(c.pix, c.w, rects)
+				if err != nil {
+					if s.closed() {
+						return
+					}
+					prev = nil
+					continue
+				}
+				copy(prev, c.pix)
+				if sent {
+					s.pending.Add(1)
+					if s.c.Send(proto.MsgFrameEnd, true) != nil {
+						return
+					}
+				}
+			}
+			if d := interval - time.Since(start); d > 0 {
+				time.Sleep(d)
+			}
+			continue
+		}
 		if len(rects) > 0 {
 			type enc struct {
 				kind byte

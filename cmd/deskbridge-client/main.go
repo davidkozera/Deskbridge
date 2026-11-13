@@ -22,6 +22,7 @@ import (
 	"time"
 	"unsafe"
 
+	"deskbridge/internal/mf"
 	"deskbridge/internal/proto"
 	"deskbridge/internal/winclip"
 )
@@ -126,13 +127,15 @@ const (
 	wmMouseHWheel = 0x020E
 	wmApp         = 0x8000
 
-	wmRepaint      = wmApp + 1 // view: a frame finished
-	wmFullscreen   = wmApp + 2 // main: Ctrl+Alt+Enter
-	wmRemoteSize   = wmApp + 3 // main: remote resolution known/changed
-	wmDisconnected = wmApp + 4 // main: wParam = link id
-	wmCursor       = wmApp + 5 // view: remote cursor shape changed
-	wmConnectDone  = wmApp + 6 // main: background connect finished
-	wmStatus       = wmApp + 8 // main: show the text left in statusText
+	wmRepaint      = wmApp + 1  // view: a frame finished
+	wmFullscreen   = wmApp + 2  // main: Ctrl+Alt+Enter
+	wmRemoteSize   = wmApp + 3  // main: remote resolution known/changed
+	wmDisconnected = wmApp + 4  // main: wParam = link id
+	wmCursor       = wmApp + 5  // view: remote cursor shape changed
+	wmConnectDone  = wmApp + 6  // main: background connect finished
+	wmStatus       = wmApp + 8  // main: show the text left in statusText
+	wmVideoFailed  = wmApp + 9  // main: the video decoder gave up; switch video off
+	wmVideoCaps    = wmApp + 10 // main: finished checking which decoders this PC has
 
 	wsOverlappedWindow = 0x00CF0000
 	wsPopup            = 0x80000000
@@ -152,6 +155,7 @@ const (
 	idFullscreen = 106
 	idToggle     = 107
 	idClipboard  = 108
+	idVideo      = 109
 
 	paneWidth   = 264 // at 96 dpi
 	toggleWidth = 16
@@ -246,6 +250,7 @@ var (
 
 	hHost, hPort, hPass, hRemember, hConnect uintptr
 	hFPS, hQuality, hAudio, hSleep, hClip    uintptr
+	hVideo                                   uintptr
 	hFullscreen, hStatus, hToggle            uintptr
 	paneCtls                                 []uintptr
 
@@ -256,6 +261,8 @@ var (
 	audioOn    atomic.Bool
 	clipOn     atomic.Bool
 	statusText atomic.Pointer[string]
+	videoCaps  atomic.Uint32 // codecs this PC can decode, once known
+	capsKnown  atomic.Bool
 
 	// Framebuffer. Decoders writing disjoint areas share the read lock; the
 	// painter and resizes take the write lock.
@@ -389,6 +396,17 @@ func main() {
 	hView, _, _ = pCreateWindowEx.Call(0, uintptr(unsafe.Pointer(viewClass)), 0, wsChild|wsVisible, 0, 0, 10, 10, hMain, 0, inst, 0)
 	loadSettings()
 	startClipboard()
+	go func() { // finding decoders can take a moment; do not hold up the window
+		var caps uint32
+		for _, c := range []byte{proto.CodecHEVC, proto.CodecH264} {
+			if mf.CanDecode(c) {
+				caps |= uint32(c)
+			}
+		}
+		videoCaps.Store(caps)
+		capsKnown.Store(true)
+		pPostMessage.Call(hMain, wmVideoCaps, 0, 0)
+	}()
 
 	// "deskbridge-client.exe HOST [PASSWORD]" fills the boxes and connects.
 	if args := os.Args[1:]; len(args) >= 1 {
@@ -501,6 +519,7 @@ func buildPane() {
 	hAudio = check(idAudio, "Play sound from the remote PC")
 	hSleep = check(idSleep, "Let the remote PC go to sleep")
 	hClip = check(idClipboard, "Share copy and paste")
+	hVideo = check(idVideo, "Use H.265 video for motion")
 	y += 8
 	hFullscreen = control("BUTTON", "Full screen  (Ctrl+Alt+Enter)", wsTabStop, 0, m, y, w, 30, idFullscreen)
 	y += 44
@@ -516,6 +535,7 @@ func buildPane() {
 	setCombo(hQuality, qualityChoices, 85)
 	setChecked(hAudio, true)
 	setChecked(hClip, true)
+	setChecked(hVideo, true)
 	pEnableWindow.Call(hFullscreen, 0)
 }
 
@@ -561,7 +581,7 @@ func layout() {
 func setStatus(s string) { setText(hStatus, s) }
 
 func settingsPayload() []byte {
-	b := []byte{byte(comboValue(hFPS, fpsChoices)), byte(comboValue(hQuality, qualityChoices)), 0, 0, 0}
+	b := []byte{byte(comboValue(hFPS, fpsChoices)), byte(comboValue(hQuality, qualityChoices)), 0, 0, 0, 0, 0}
 	if checked(hAudio) {
 		b[2] = 1
 	}
@@ -571,6 +591,10 @@ func settingsPayload() []byte {
 	if checked(hClip) {
 		b[4] = 1
 	}
+	if checked(hVideo) {
+		b[5] = 1
+	}
+	b[6] = byte(videoCaps.Load())
 	return b
 }
 
@@ -632,6 +656,7 @@ func saveSettings() {
 		"audio=" + b(checked(hAudio)),
 		"sleep=" + b(checked(hSleep)),
 		"clipboard=" + b(checked(hClip)),
+		"video=" + b(checked(hVideo)),
 		"remember=" + b(checked(hRemember)),
 	}
 	if checked(hRemember) {
@@ -671,6 +696,8 @@ func loadSettings() {
 			setChecked(hSleep, v == "1")
 		case "clipboard":
 			setChecked(hClip, v == "1")
+		case "video":
+			setChecked(hVideo, v == "1")
 		case "remember":
 			setChecked(hRemember, v == "1")
 		case "password":
@@ -749,7 +776,7 @@ func onConnectDone() {
 	applySettings()
 	setText(hConnect, "Disconnect")
 	pEnableWindow.Call(hFullscreen, 1)
-	setStatus("Connected to " + l.host + ".\r\n\r\nClick the remote screen to type on the remote PC. Click in this pane to get your own keyboard back.")
+	setStatus("Connected to " + l.host + ".\r\n\r\nClick the remote screen to type on the remote PC. Click in this pane to get your own keyboard back." + videoNote())
 	pSetFocus.Call(hView)
 }
 
@@ -815,6 +842,134 @@ func sender(l *link) {
 	}
 }
 
+// ---------- video for motion ----------
+
+// videoNote explains, when it matters, why H.265 is not what is being used.
+func videoNote() string {
+	if !checked(hVideo) || !capsKnown.Load() {
+		return ""
+	}
+	caps := byte(videoCaps.Load())
+	switch {
+	case caps&proto.CodecHEVC != 0:
+		return ""
+	case caps&proto.CodecH264 != 0:
+		return "\r\n\r\nThis PC has no H.265 decoder, so motion uses H.264 instead. For H.265, install \"HEVC Video Extensions\" from the Microsoft Store and restart Deskbridge."
+	}
+	return "\r\n\r\nThis PC has no video decoder Deskbridge can use, so motion is sent the standard way."
+}
+
+// gpuBroken is set if decoding on the graphics card failed, so the rest of
+// this run uses the software decoder.
+var gpuBroken atomic.Bool
+
+// videoSink decodes the video the server sends during motion and draws it
+// into the framebuffer. Used only by the receiver goroutine.
+type videoSink struct {
+	dec       *mf.Decoder
+	codec     byte
+	w, h      int
+	failed    bool   // ignore video until the server starts a new stream
+	announced bool   // said which decoder is in use
+	notice    string // what the server said about its encoder
+	restart   func() // asks the server for a new stream
+	// The changed areas that came with the last few frames. Only those are
+	// redrawn from video, so the rest of the screen stays pixel-perfect. A
+	// few frames' worth are kept because a decoder may hand pictures back a
+	// frame or two late.
+	recent [3][]proto.Rect
+}
+
+func (v *videoSink) close() {
+	if v.dec != nil {
+		v.dec.Close()
+		v.dec = nil
+	}
+}
+
+// fail gives up on video for this connection and has the option unticked.
+func (v *videoSink) fail(err error) {
+	v.failed = true
+	v.close()
+	s := "Video for motion was switched off because decoding failed (" + err.Error() + "). The picture continues the standard way."
+	statusText.Store(&s)
+	pPostMessage.Call(hMain, wmVideoFailed, 0, 0)
+}
+
+func (v *videoSink) handle(p []byte) {
+	if len(p) < 8 {
+		return
+	}
+	flags, codec := p[0], p[1]
+	w, h := int(binary.LittleEndian.Uint16(p[2:])), int(binary.LittleEndian.Uint16(p[4:]))
+	n := int(binary.LittleEndian.Uint16(p[6:]))
+	if len(p) < 8+8*n+1 {
+		return
+	}
+	if n > 0 {
+		areas := make([]proto.Rect, n)
+		for i := range areas {
+			q := p[8+8*i:]
+			areas[i] = proto.Rect{X: int(binary.LittleEndian.Uint16(q)), Y: int(binary.LittleEndian.Uint16(q[2:])),
+				W: int(binary.LittleEndian.Uint16(q[4:])), H: int(binary.LittleEndian.Uint16(q[6:]))}
+		}
+		v.recent[0], v.recent[1], v.recent[2] = areas, v.recent[0], v.recent[1]
+	}
+	frame := p[8+8*n:]
+	if flags&2 != 0 {
+		v.failed = false // the server started a fresh stream: try again
+	}
+	if v.failed || w < 2 || h < 2 {
+		return
+	}
+	if v.dec == nil || flags&2 != 0 || codec != v.codec || w != v.w || h != v.h {
+		v.close()
+		dec, err := mf.NewDecoder(codec, w, h, !gpuBroken.Load())
+		if err != nil {
+			v.fail(err)
+			return
+		}
+		v.dec, v.codec, v.w, v.h, v.announced = dec, codec, w, h, false
+	}
+	var areas []proto.Rect
+	for _, a := range v.recent {
+		areas = append(areas, a...)
+	}
+	shown := false
+	err := v.dec.Decode(frame, func(y, uv []byte, stride int) {
+		shown = true
+		fbMu.RLock()
+		if fb != nil && fbW >= w && fbH >= h {
+			proto.NV12RectsToBGRA(fb, fbW, y, uv, stride, w, h, areas)
+		}
+		fbMu.RUnlock()
+	})
+	if err != nil {
+		if v.dec.AskedGPU() && v.restart != nil {
+			// The graphics card's decoder let us down. Fall back to the
+			// software decoder; that needs a stream that starts afresh.
+			gpuBroken.Store(true)
+			v.failed = true
+			v.close()
+			v.restart()
+			return
+		}
+		v.fail(err)
+		return
+	}
+	if shown && !v.announced {
+		v.announced = true
+		if v.notice == "" {
+			v.notice = "Motion is being sent as " + mf.CodecName(codec) + " video."
+		}
+		where := "in software (not on the graphics card)"
+		if v.dec.OnGPU() {
+			where = "on the graphics card"
+		}
+		postStatus(v.notice + "\r\n\r\nDecoded here " + where + " by: " + v.dec.Name + ".")
+	}
+}
+
 // ---------- clipboard ----------
 
 var clip *winclip.Sync
@@ -857,6 +1012,13 @@ func receiver(l *link) {
 	defer close(jobs)
 	var audio player
 	defer audio.close()
+	video := videoSink{restart: func() {
+		select {
+		case l.bulk <- [2][]byte{{proto.MsgVideoRestart}, nil}:
+		case <-l.done:
+		}
+	}}
+	defer video.close()
 	// Clipboard data is never dropped, but waits its turn behind input.
 	var peer *winclip.Peer
 	if clip != nil {
@@ -900,6 +1062,13 @@ func receiver(l *link) {
 			}
 			wg.Add(1)
 			jobs <- job{p[8], p[9:], r}
+		case proto.MsgNotice:
+			if len(p) <= 600 {
+				video.notice = string(p)
+			}
+		case proto.MsgVideo:
+			wg.Wait() // anything drawn before this frame must land first
+			video.handle(p)
 		case proto.MsgFrameEnd:
 			wg.Wait()
 			pPostMessage.Call(hView, wmRepaint, 0, 0)
@@ -952,7 +1121,7 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 				startConnect()
 			}
 		case (id == idFPS || id == idQuality) && code == 1, // CBN_SELCHANGE
-			(id == idAudio || id == idSleep || id == idRemember || id == idClipboard) && code == 0:
+			(id == idAudio || id == idSleep || id == idRemember || id == idClipboard || id == idVideo) && code == 0:
 			applySettings()
 		case id == idFullscreen && code == 0:
 			if cur.Load() != nil {
@@ -1003,6 +1172,23 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 		return 0
 	case wmConnectDone:
 		onConnectDone()
+		return 0
+	case wmVideoCaps:
+		if cur.Load() != nil {
+			applySettings() // tell the server what we can decode
+			if note := videoNote(); note != "" {
+				setStatus(strings.TrimSpace(note))
+			}
+		}
+		return 0
+	case wmVideoFailed:
+		if checked(hVideo) {
+			setChecked(hVideo, false)
+			applySettings()
+		}
+		if s := statusText.Swap(nil); s != nil {
+			setStatus(*s)
+		}
 		return 0
 	case wmStatus:
 		if s := statusText.Swap(nil); s != nil && cur.Load() != nil {

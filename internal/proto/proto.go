@@ -22,16 +22,25 @@ const (
 	MsgCursor   = 4 // system cursor id u16
 	MsgAudioFmt = 5 // sample rate u32 (always 16-bit stereo)
 	MsgAudio    = 6 // s16le stereo PCM
+	MsgVideo    = 7 // flags u8 (1=key frame, 2=new stream), codec u8, w u16, h u16, n u16, n changed areas (x,y,w,h u16), one encoded frame
+	MsgNotice   = 8 // UTF-8 text for the client to show in its pane
 )
 
 // Client -> server
 const (
-	MsgAck       = 16
-	MsgMouseMove = 17 // x,y u16
-	MsgMouseBtn  = 18 // button u8 (0=L 1=R 2=M 3=X1 4=X2), down u8, x,y u16
-	MsgWheel     = 19 // delta i16, horizontal u8
-	MsgKey       = 20 // vk u16, scan u16, flags u8 (1=extended, 2=up)
-	MsgSettings  = 21 // fps u8, jpeg quality u8, audio on u8, allow sleep u8
+	MsgAck          = 16
+	MsgMouseMove    = 17 // x,y u16
+	MsgMouseBtn     = 18 // button u8 (0=L 1=R 2=M 3=X1 4=X2), down u8, x,y u16
+	MsgWheel        = 19 // delta i16, horizontal u8
+	MsgKey          = 20 // vk u16, scan u16, flags u8 (1=extended, 2=up)
+	MsgSettings     = 21 // fps u8, quality u8, audio on u8, allow sleep u8, clipboard on u8, video on u8, decodable codecs u8 (bit per codec)
+	MsgVideoRestart = 22 // the client lost its decoder: begin a new video stream
+)
+
+// Video codecs. The values are also bit positions in the settings message.
+const (
+	CodecHEVC = 1 // H.265
+	CodecH264 = 2
 )
 
 const maxMsg = 64 << 20

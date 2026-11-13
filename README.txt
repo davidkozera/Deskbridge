@@ -56,6 +56,7 @@ USING THE CLIENT
                                from here. Stays as set until that PC
                                restarts.
   Share copy and paste         See COPY AND PASTE below.
+  Use H.265 video for motion   See VIDEO FOR MOTION below.
   Full screen                  Also Ctrl+Alt+Enter, which is the way
                                back out.
 
@@ -75,6 +76,33 @@ USING THE CLIENT
   Signing in remotely: click or press a key to raise the lock screen,
   then type your Windows Hello PIN. Face and fingerprint sign-in need
   you to be at the PC.
+
+VIDEO FOR MOTION
+  A still screen is sent as exact pixels, so text stays perfectly sharp.
+  When a large part of the screen keeps changing for more than about
+  half a second (a film, scrolling, dragging a window), the server
+  switches those areas to H.265 video, using the Arm PC's hardware
+  encoder. About a third of a second after the motion stops it switches
+  back and redraws those areas crisply. The rest of the screen stays
+  pixel-perfect throughout. Short bursts, such as a window opening or
+  closing, are always sent the standard way.
+
+  - The client needs an H.265 decoder: install "HEVC Video Extensions"
+    from the Microsoft Store if it is missing. Without it, H.264 (built
+    into Windows) is used instead, and the client's pane says so.
+  - Decoding is done by the client PC's graphics card when it can
+    decode the codec, and in software otherwise (or if the card's
+    decoder fails; Deskbridge then switches over by itself).
+  - The pane shows which encoder and decoder are in use the first time
+    video starts. You want "hardware" for the encoder and "on the
+    graphics card" for the decoder. If the encoder says otherwise and
+    the Arm PC runs hot, untick the option.
+  - "Picture quality" sets the video bit rate; "Frames per second" its
+    frame rate.
+  - If anything goes wrong with the encoder or decoder, Deskbridge falls
+    back to the standard method by itself. Untick "Use H.265 video for
+    motion" to switch it off altogether.
+  - Details of what the server tried are in deskbridge.log.
 
 COPY AND PASTE
   While connected, whatever you copy on one PC can be pasted on the
