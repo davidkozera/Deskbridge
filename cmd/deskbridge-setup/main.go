@@ -91,8 +91,9 @@ const (
 	wmCommand = 0x0111
 	wmApp     = 0x8000
 
-	wmProgress = wmApp + 1 // show the text left in statusText
-	wmDone     = wmApp + 2 // the work finished; wParam 1 = uninstalled
+	wmProgress      = wmApp + 1 // show the text left in statusText
+	wmDone          = wmApp + 2 // the work finished; wParam 1 = uninstalled
+	wmPublicNetwork = wmApp + 3 // this PC's network turned out to be a Public one
 
 	wsCaption    = 0x00C00000
 	wsSysMenu    = 0x00080000
@@ -112,8 +113,9 @@ const (
 	idClient    = 102
 	idUninstall = 103
 	idOpen      = 104
+	idPublic    = 105
 
-	clientW, clientH = 520, 470 // at 96 dpi
+	clientW, clientH = 520, 500 // at 96 dpi
 )
 
 type wndClassEx struct {
@@ -144,7 +146,7 @@ type msg struct {
 var (
 	inst, hMain, hFont, hBold                    uintptr
 	hServer, hClient, hInstall, hUninstall, hOut uintptr
-	hOpen, hClose                                uintptr
+	hOpen, hClose, hPublic                       uintptr
 	dpi                                          = 96
 	busy                                         bool
 	statusText                                   atomic.Pointer[string]
@@ -330,13 +332,23 @@ func build() {
 	control("STATIC", "Choose what to install on this PC. Installing over an older version updates it and keeps its password and settings.", 0, 0, m, 50, w, 36, 0, hFont)
 	hServer = control("BUTTON", "Server: let this PC be controlled from another PC", 0x3|wsTabStop, 0, m, 96, w, 22, idServer, hFont)
 	control("STATIC", "Starts with Windows and works at the lock screen.", 0, 0, m+18, 118, w-18, 18, 0, hFont)
-	hClient = control("BUTTON", "Client: control another PC from this one", 0x3|wsTabStop, 0, m, 146, w, 22, idClient, hFont)
-	control("STATIC", "Adds Deskbridge to the Start menu.", 0, 0, m+18, 168, w-18, 18, 0, hFont)
-	hOut = control("EDIT", "", esMultiline|esReadOnly|esAutoVScrol|wsVScroll, 0x200, m, 200, w, 196, 0, hFont)
-	hInstall = control("BUTTON", "Install", 0x1|wsTabStop, 0, m, 414, 110, 32, idInstall, hFont)
-	hUninstall = control("BUTTON", "Uninstall", wsTabStop, 0, m+122, 414, 110, 32, idUninstall, hFont)
-	hOpen = control("BUTTON", "Open Deskbridge", wsTabStop, 0, m+244, 414, 124, 32, idOpen, hFont)
-	hClose = control("BUTTON", "Close", wsTabStop, 0, m+w-100, 414, 100, 32, idClose, hFont)
+	hPublic = control("BUTTON", "Also allow connections while on a public network", 0x3|wsTabStop, 0, m+18, 140, w-18, 22, idPublic, hFont)
+	hClient = control("BUTTON", "Client: control another PC from this one", 0x3|wsTabStop, 0, m, 176, w, 22, idClient, hFont)
+	control("STATIC", "Adds Deskbridge to the Start menu.", 0, 0, m+18, 198, w-18, 18, 0, hFont)
+	hOut = control("EDIT", "", esMultiline|esReadOnly|esAutoVScrol|wsVScroll, 0x200, m, 230, w, 196, 0, hFont)
+	hInstall = control("BUTTON", "Install", 0x1|wsTabStop, 0, m, 444, 110, 32, idInstall, hFont)
+	hUninstall = control("BUTTON", "Uninstall", wsTabStop, 0, m+122, 444, 110, 32, idUninstall, hFont)
+	hOpen = control("BUTTON", "Open Deskbridge", wsTabStop, 0, m+244, 444, 124, 32, idOpen, hFont)
+	hClose = control("BUTTON", "Close", wsTabStop, 0, m+w-100, 444, 100, 32, idClose, hFont)
+	setChecked(hPublic, exists(publicMarker()))
+	// Windows Firewall treats a network as Public or Private. If this PC's
+	// network is Public, a rule for private networks alone would leave the
+	// server unreachable, so offer the wider rule up front.
+	go func() {
+		if strings.Contains(networkCategories(), "Public") {
+			pPostMessage.Call(hMain, wmPublicNetwork, 0, 0)
+		}
+	}()
 
 	// Start from what is already installed; on a fresh PC, guess from its
 	// processor: Arm PCs are usually the one being controlled.
@@ -370,6 +382,7 @@ func refresh() {
 	on(hUninstall, !busy && installed)
 	on(hOpen, !busy && exists(clientPath()))
 	on(hServer, !busy)
+	on(hPublic, !busy && checked(hServer))
 	on(hClient, !busy)
 	on(hClose, !busy)
 	if installed {
@@ -409,6 +422,10 @@ func wndProc(h, message, wParam, lParam uintptr) uintptr {
 				pDestroyWindow.Call(h)
 			}
 		}
+		return 0
+	case wmPublicNetwork:
+		// Say so, but leave the choice to the person at the PC.
+		setText(hPublic, "Also allow connections while on a public network (this one is public)")
 		return 0
 	case wmProgress:
 		if s := statusText.Swap(nil); s != nil {
@@ -455,6 +472,7 @@ func say(format string, a ...any) {
 // folder.
 func runSilent(relaunch bool) int {
 	server, client := exists(serverPath()), exists(clientPath())
+	allowPublic = exists(publicMarker()) // an update keeps the choice made at install
 	ok := false
 	if !server && !client {
 		say("Deskbridge is not installed on this PC, so there is nothing to update.")
@@ -496,6 +514,7 @@ func startWork(uninstalling bool) {
 	refresh()
 	log.Reset()
 	server, client := checked(hServer), checked(hClient)
+	allowPublic = checked(hPublic)
 	go func() {
 		done := uintptr(0)
 		if uninstalling {
@@ -555,6 +574,137 @@ func extract(name, dst string) error {
 	}
 }
 
+// ---------- Windows Firewall ----------
+
+const (
+	firewallRule       = "Deskbridge server"
+	firewallRulePublic = "Deskbridge server (public networks)"
+)
+
+// allowPublic is whether the rule should cover public networks as well.
+var allowPublic bool
+
+// publicMarker is a file whose presence records that choice, so updates
+// (which run without a window) keep it.
+func publicMarker() string { return filepath.Join(installDir(), "allow-public-networks") }
+
+// raw runs a command line exactly as written. netsh reads its command line
+// its own way, so quoting is spelled out instead of left to the usual rules.
+func raw(program, commandLine string) (string, error) {
+	cmd := exec.Command(program)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000, CmdLine: program + " " + commandLine}
+	out, err := cmd.CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
+func powershell(script string) (string, error) {
+	return hidden("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
+}
+
+// networkCategories is how Windows classes the networks this PC is on right
+// now, such as "Private" or "Public", comma-separated; empty if unknown.
+func networkCategories() string {
+	out, err := powershell("(Get-NetConnectionProfile | ForEach-Object { $_.NetworkCategory }) -join ','")
+	if err != nil {
+		return ""
+	}
+	return out
+}
+
+// firewall replaces the server's Windows Firewall rules, checks that they
+// are really there, and says what it found. It reports whether the server
+// can be reached through the firewall.
+//
+// There are up to two rules: one for private and work networks, and, if the
+// person asked for it, one for public networks that only lets in PCs on the
+// same local network.
+func firewall() bool {
+	if hMain == 0 {
+		// An update with no window: rules that are there already are right
+		// (the program has not moved), so leave a working setup alone.
+		if _, missing := raw("netsh.exe", `advfirewall firewall show rule name="`+firewallRule+`"`); missing == nil {
+			say("  Windows Firewall: rule \"%s\" is in place.", firewallRule)
+			return true
+		}
+	}
+	if allowPublic {
+		os.WriteFile(publicMarker(), []byte("yes\r\n"), 0644)
+	} else {
+		os.Remove(publicMarker())
+	}
+	removeFirewallRules()
+	okPrivate, why := addFirewallRule(firewallRule, "Private,Domain", "")
+	if !okPrivate {
+		say("  Windows Firewall: the rule could NOT be added, so other PCs will be blocked.")
+		if why != "" {
+			say("  Windows said: %s", why)
+		}
+		say("  To fix it by hand: Windows Security > Firewall & network protection > Allow an app")
+		say("  through firewall > add %s", serverPath())
+		return false
+	}
+	say("  Windows Firewall: rule \"%s\" added and checked (private and work networks).", firewallRule)
+	// A rule that blocks the program wins over one that allows it. Windows
+	// makes such rules when its "allow access?" question is cancelled.
+	if blocking, err := powershell("(Get-NetFirewallApplicationFilter -Program '" + serverPath() + "' -ErrorAction SilentlyContinue | " +
+		"Get-NetFirewallRule | Where-Object { $_.Action -eq 'Block' -and $_.Enabled -eq 'True' -and $_.Direction -eq 'Inbound' } | " +
+		"ForEach-Object { $_.DisplayName } | Select-Object -Unique) -join '; '"); err == nil && blocking != "" {
+		say("  BUT another firewall rule blocks the server and takes priority: %s", blocking)
+		say("  Remove it in Windows Defender Firewall with Advanced Security > Inbound Rules.")
+	}
+	public := strings.Contains(networkCategories(), "Public")
+	if allowPublic {
+		if ok, why := addFirewallRule(firewallRulePublic, "Public", "LocalSubnet"); ok {
+			say("  Windows Firewall: rule \"%s\" added and checked", firewallRulePublic)
+			say("  (PCs on the same network only).")
+		} else {
+			say("  Windows Firewall: the rule for public networks could NOT be added. %s", why)
+			return !public
+		}
+	} else if public {
+		say("  BUT this PC's network is set to Public, so Windows will still block the server here.")
+		say("  Either tick \"Also allow connections while on a public network\" and click Install again,")
+		say("  or set the network to Private (Settings > Network & internet > your connection).")
+	}
+	return true
+}
+
+func removeFirewallRules() {
+	for _, name := range []string{firewallRule, firewallRulePublic} {
+		raw("netsh.exe", `advfirewall firewall delete rule name="`+name+`"`)
+	}
+}
+
+// addFirewallRule lets the server program accept connections on its port on
+// the given kinds of network, from the given addresses ("" for any). It
+// tries two ways of making the rule, so that one being unavailable or
+// refused does not leave the PC without one, then looks for the rule rather
+// than trusting either. On failure it returns what Windows said.
+func addFirewallRule(name, profiles, from string) (bool, string) {
+	ps := "$ErrorActionPreference='Stop'; New-NetFirewallRule -DisplayName '" + name + "' -Direction Inbound -Action Allow -Program '" +
+		serverPath() + "' -Protocol TCP -LocalPort " + proto.DefaultPort + " -Profile " + profiles
+	ns := `advfirewall firewall add rule name="` + name + `" dir=in action=allow program="` + serverPath() +
+		`" protocol=TCP localport=` + proto.DefaultPort + ` profile=` + strings.ToLower(profiles) + ` enable=yes`
+	if from != "" {
+		ps += " -RemoteAddress " + from
+		ns += " remoteip=" + strings.ToLower(from)
+	}
+	why, err := powershell(ps + " | Out-Null")
+	if err != nil {
+		var out string
+		if out, err = raw("netsh.exe", ns); err != nil {
+			why = strings.Join(strings.Fields(why+" "+out), " ")
+		}
+	}
+	if _, missing := raw("netsh.exe", `advfirewall firewall show rule name="`+name+`"`); missing != nil {
+		if len(why) > 300 {
+			why = why[:300] + "..."
+		}
+		return false, why
+	}
+	return true, ""
+}
+
 // stopService stops the Deskbridge service, if there is one, and waits for
 // it, so that its program can be replaced.
 func stopService() {
@@ -605,23 +755,33 @@ func install(server, client bool) bool {
 			say("  Failed: %v", err)
 			failed = true
 			startService() // the previous version is still in place: bring it back
-		} else if out, err := hidden(serverPath(), "install", "quiet"); err != nil {
-			// The server program registers its own service and firewall rule.
-			say("  The service could not be set up:\r\n  %s", strings.ReplaceAll(out, "\n", "\r\n  "))
-			failed = true
 		} else {
-			host, _ := os.Hostname()
-			pw, _ := os.ReadFile(filepath.Join(dir, "deskbridge-password.txt"))
-			say("  Done. It is running now and starts with Windows.")
-			say("")
-			say("  To connect from the other PC, use:")
-			say("    Computer:  %s", host)
-			for _, ip := range localIPs() {
-				say("          or:  %s", ip)
+			// The firewall rule goes in first, so that the server is never
+			// listening without one.
+			firewallOK := firewall()
+			if out, err := hidden(serverPath(), "install", "quiet"); err != nil {
+				// The server program registers its own service.
+				say("  The service could not be set up:\r\n  %s", strings.ReplaceAll(out, "\n", "\r\n  "))
+				failed = true
+			} else {
+				host, _ := os.Hostname()
+				pw, _ := os.ReadFile(filepath.Join(dir, "deskbridge-password.txt"))
+				say("  Done. It is running now and starts with Windows.")
+				say("")
+				say("  To connect from the other PC, use:")
+				say("    Computer:  %s", host)
+				for _, ip := range localIPs() {
+					say("          or:  %s", ip)
+				}
+				say("    Port:      %s", proto.DefaultPort)
+				say("    Password:  %s", strings.TrimSpace(string(pw)))
+				say("")
+				if !firewallOK {
+					say("  Other PCs cannot connect until the Windows Firewall problem above is fixed.")
+					say("")
+					failed = true
+				}
 			}
-			say("    Port:      %s", proto.DefaultPort)
-			say("    Password:  %s", strings.TrimSpace(string(pw)))
-			say("")
 		}
 	}
 
@@ -684,6 +844,7 @@ func uninstall() {
 			say("  Server service and firewall rule removed.")
 		}
 	}
+	removeFirewallRules()
 	hidden("taskkill.exe", "/F", "/IM", "deskbridge-client.exe")
 	os.Remove(shortcutPath())
 	hidden("reg.exe", "delete", uninstallKey, "/f")

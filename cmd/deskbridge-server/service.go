@@ -146,6 +146,19 @@ func run(name string, args ...string) error {
 	return nil
 }
 
+// netsh runs a netsh command given exactly as it would be typed. netsh reads
+// its command line its own way, so the quoting is spelled out here instead
+// of being left to the usual argument rules.
+func netsh(command string) error {
+	cmd := exec.Command("netsh.exe")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CmdLine: "netsh.exe " + command}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func install() {
 	scm, ok := openSCM("install")
 	if !ok {
@@ -193,10 +206,14 @@ func install() {
 		fmt.Println("Warning: could not restrict who can read the password file:", err)
 	}
 
-	run("netsh", "advfirewall", "firewall", "delete", "rule", "name="+firewallRule)
-	if err := run("netsh", "advfirewall", "firewall", "add", "rule", "name="+firewallRule, "dir=in", "action=allow",
-		"program="+dst, "protocol=TCP", "localport="+proto.DefaultPort, "profile=private,domain", "enable=yes"); err != nil {
-		fmt.Println("Warning: could not add the Windows Firewall rule; you may need to allow port", proto.DefaultPort, "yourself:", err)
+	// When the setup program installs us it manages the firewall rule itself
+	// (and checks it); this covers "deskbridge-server.exe install" by hand.
+	if !quiet {
+		netsh(`advfirewall firewall delete rule name="` + firewallRule + `"`)
+		if err := netsh(`advfirewall firewall add rule name="` + firewallRule + `" dir=in action=allow program="` + dst +
+			`" protocol=TCP localport=` + proto.DefaultPort + ` profile=private,domain enable=yes`); err != nil {
+			fmt.Println("Warning: could not add the Windows Firewall rule; you may need to allow port", proto.DefaultPort, "yourself:", err)
+		}
 	}
 
 	binPath := `"` + dst + `" service`
@@ -244,7 +261,8 @@ func uninstall() {
 	defer pCloseServiceHandle.Call(scm)
 	defer pause()
 	removeService(scm)
-	run("netsh", "advfirewall", "firewall", "delete", "rule", "name="+firewallRule)
+	netsh(`advfirewall firewall delete rule name="` + firewallRule + `"`)
+	netsh(`advfirewall firewall delete rule name="` + firewallRule + ` (public networks)"`)
 	dir := installDir()
 	if self, _ := os.Executable(); !strings.EqualFold(filepath.Dir(self), dir) {
 		time.Sleep(time.Second)

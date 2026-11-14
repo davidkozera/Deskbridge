@@ -27,6 +27,7 @@ const (
 	MsgUpdateResult = 9  // ok u8, then text: the server's answer to an update it was sent
 	MsgMonitors     = 10 // selected i8 (-1 = all), count u8, then per display: x i32, y i32, w u32, h u32, flags u8 (1 = main)
 	MsgPong         = 11 // the answer to MsgPing
+	MsgModes        = 12 // current w u16, h u16, count u8, then that many (w u16, h u16): resolutions the shown display supports
 )
 
 // Client -> server
@@ -44,6 +45,7 @@ const (
 	MsgSelectMonitor = 26 // i8: which display to show, -1 for all of them
 	MsgAction        = 27 // u8: one of the Action values
 	MsgPing          = 28 // "are you there?", sent every couple of seconds
+	MsgSetResolution = 29 // w u16, h u16: change the shown display's resolution; 0,0 puts it back
 )
 
 // Things the client can ask the server to do that cannot be done by sending

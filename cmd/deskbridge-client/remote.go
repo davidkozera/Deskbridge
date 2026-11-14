@@ -123,6 +123,11 @@ func displayPicked() {
 		index = -1 // all
 	}
 	wantedDisplay, displayRequested = index, true
+	if p := currentProfile(); p >= 0 {
+		computers[p].display = index
+	}
+	// The connection's resolution goes with it to the display now chosen.
+	resRequested = false
 	queue(proto.MsgSelectMonitor, []byte{byte(int8(index))})
 	saveSettings()
 	pSetFocus.Call(hView)

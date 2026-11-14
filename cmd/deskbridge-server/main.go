@@ -310,6 +310,7 @@ func serve(nc net.Conn, cfg *tls.Config, key []byte) {
 	inputLoop(s, peer)
 	s.close()
 	peer.Close()
+	restoreResolutionsLater()
 	log.Printf("%s: disconnected", remote)
 }
 
@@ -545,6 +546,10 @@ func inputLoop(s *session, peer clipPeer) {
 			if len(p) >= 1 {
 				s.monitor.Store(int32(int8(p[0])))
 			}
+		case proto.MsgSetResolution:
+			if len(p) >= 4 {
+				go changeResolution(s, int(binary.LittleEndian.Uint16(p)), int(binary.LittleEndian.Uint16(p[2:])))
+			}
 		case proto.MsgAction:
 			if len(p) >= 1 {
 				doAction(s, p[0])
@@ -714,6 +719,13 @@ func videoLoop(s *session) {
 			if s.c.Send(proto.MsgSize, false, sz) != nil {
 				return
 			}
+			// Which display this is, and the resolutions it could be set to.
+			device := ""
+			if c.selected >= 0 && len(c.parts) == 1 {
+				device = c.parts[0].device
+			}
+			shownDevice.Store(&device)
+			s.c.Send(proto.MsgModes, false, describeModes(device, c.w, c.h))
 		}
 
 		ci := cursorInfo{size: uint32(unsafe.Sizeof(cursorInfo{}))}

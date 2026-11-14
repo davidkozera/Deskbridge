@@ -232,7 +232,7 @@ type kbdllHook struct {
 type link struct {
 	id    uintptr
 	c     *proto.Conn
-	host  string
+	name  string         // what the connection is called
 	out   chan [2][]byte // {type, payload}: input, may be dropped if stalled
 	bulk  chan [2][]byte // clipboard data: never dropped, yields to input
 	done  chan struct{}
@@ -255,13 +255,13 @@ var (
 	inst, hMain, hView, hFont uintptr
 	dpi                       = 96
 
-	hHost, hPort, hPass, hRemember, hConnect uintptr
-	hFPS, hQuality, hAudio, hSleep, hClip    uintptr
-	hVideo, hFast                            uintptr
-	hVersion                                 uintptr
-	statusTop                                int // where the status text starts, at 96 dpi
-	hFullscreen, hStatus, hToggle            uintptr
-	paneCtls                                 []uintptr
+	hName, hHost, hPort, hPass, hRemember, hConnect uintptr
+	hFPS, hQuality, hAudio, hSleep, hClip           uintptr
+	hVideo, hFast                                   uintptr
+	hVersion                                        uintptr
+	statusTop                                       int // where the status text starts, at 96 dpi
+	hFullscreen, hStatus, hToggle                   uintptr
+	paneCtls                                        []uintptr
 
 	cur        atomic.Pointer[link] // nil when not connected
 	nextLinkID uintptr
@@ -428,6 +428,15 @@ func main() {
 			host = h
 			setText(hPort, p)
 		}
+		// A saved connection can be given by its name or by its computer.
+		name := host
+		for _, c := range computers {
+			if strings.EqualFold(c.name, host) || strings.EqualFold(c.host, host) {
+				name, host = c.name, c.host
+				break
+			}
+		}
+		setText(hName, name)
 		setText(hHost, host)
 		if len(args) >= 2 {
 			setText(hPass, args[1])
@@ -436,7 +445,7 @@ func main() {
 	// The pane starts collapsed. With a computer and password already known
 	// we connect straight away; otherwise the pane opens so they can be
 	// entered.
-	ready := getText(hHost) != "" && getText(hPass) != ""
+	ready := typedTarget().host != "" && getText(hPass) != ""
 	collapsed = ready
 	layout()
 	pShowWindow.Call(hMain, 1)
@@ -444,7 +453,7 @@ func main() {
 		pSetFocus.Call(hView)
 		connectAtLaunch()
 	} else {
-		pSetFocus.Call(hHost)
+		pSetFocus.Call(hName)
 	}
 
 	// Low-level hook so Win, Alt+Tab and friends go to the remote PC while
@@ -500,30 +509,27 @@ func buildPane() {
 		y += 34
 		return h
 	}
-	combo := func(id int, choices []int, suffix string) uintptr {
-		h := control("COMBOBOX", "", cbsDropDownList|wsVScroll|wsTabStop, 0, m, y, w, 240, id)
-		for _, c := range choices {
-			pSendMessage.Call(h, 0x0143, 0, uintptr(unsafe.Pointer(u16ptr(strconv.Itoa(c)+suffix)))) // CB_ADDSTRING
-		}
-		y += 36
-		return h
-	}
 	check := func(id int, text string) uintptr {
 		h := control("BUTTON", text, bsAutoCheck|wsTabStop, 0, m, y, w, 22, id)
 		y += 28
 		return h
 	}
 
-	label("Computer (name or IP address)")
-	// Type a new one, or pick a saved one from the list.
-	hHost = control("COMBOBOX", "", 0x2|0x40|wsVScroll|wsTabStop, 0, m, y, w, 240, idHost)
+	label("Connection name")
+	// Type a name for a new one, or pick a saved one from the list.
+	hName = control("COMBOBOX", "", 0x2|0x40|wsVScroll|wsTabStop, 0, m, y, w, 240, idName)
 	y += 34
-	label("Port")
-	hPort = edit(esNumber)
+	const portW = 66
+	control("STATIC", "Computer (name or IP)", 0, 0, m, y, w-portW-8, 18, 0)
+	control("STATIC", "Port", 0, 0, m+w-portW, y, portW, 18, 0)
+	y += 20
+	hHost = control("EDIT", "", esAutoHScroll|wsTabStop, clientEdge, m, y, w-portW-8, 24, 0)
+	hPort = control("EDIT", "", esNumber|esAutoHScroll|wsTabStop, clientEdge, m+w-portW, y, portW, 24, 0)
+	y += 34
 	label("Password")
 	hPass = edit(esPassword)
 	hRemember = check(idRemember, "Remember password")
-	hForget = control("BUTTON", "Forget this computer", wsTabStop, 0, m, y, w, 26, idForget)
+	hForget = control("BUTTON", "Forget this connection", wsTabStop, 0, m, y, w, 26, idForget)
 	pEnableWindow.Call(hForget, 0)
 	y += 34
 	hConnect = control("BUTTON", "Connect", bsDefPush|wsTabStop, 0, m, y, w, 32, idConnect)
@@ -533,10 +539,24 @@ func buildPane() {
 	hMonitor = control("COMBOBOX", "", cbsDropDownList|wsVScroll|wsTabStop, 0, m, y, w, 240, idMonitor)
 	pEnableWindow.Call(hMonitor, 0)
 	y += 36
-	label("Frames per second")
-	hFPS = combo(idFPS, fpsChoices, "")
-	label("Picture quality (photos and video)")
-	hQuality = combo(idQuality, qualityChoices, " %")
+	label("Remote resolution")
+	hRes = control("COMBOBOX", "", cbsDropDownList|wsVScroll|wsTabStop, 0, m, y, w, 320, idResolution)
+	y += 36
+	// Frames per second and picture quality share a row.
+	const half = (w - 8) / 2
+	control("STATIC", "Frames per second", 0, 0, m, y, half, 18, 0)
+	control("STATIC", "Picture quality", 0, 0, m+half+8, y, half, 18, 0)
+	y += 20
+	pair := func(id, x int, choices []int, suffix string) uintptr {
+		h := control("COMBOBOX", "", cbsDropDownList|wsVScroll|wsTabStop, 0, x, y, half, 240, id)
+		for _, c := range choices {
+			pSendMessage.Call(h, 0x0143, 0, uintptr(unsafe.Pointer(u16ptr(strconv.Itoa(c)+suffix)))) // CB_ADDSTRING
+		}
+		return h
+	}
+	hFPS = pair(idFPS, m, fpsChoices, "")
+	hQuality = pair(idQuality, m+half+8, qualityChoices, " %")
+	y += 36
 	hAudio = check(idAudio, "Play sound from the remote PC")
 	hSleep = check(idSleep, "Let the remote PC go to sleep")
 	hClip = check(idClipboard, "Share copy and paste")
@@ -567,6 +587,7 @@ func buildPane() {
 	pSendMessage.Call(hToggle, wmSetFont, hFont, 1)
 
 	setText(hPort, proto.DefaultPort)
+	showResolutions()
 	setCombo(hFPS, fpsChoices, 30)
 	setCombo(hQuality, qualityChoices, 85)
 	setChecked(hAudio, true)
@@ -730,6 +751,7 @@ func saveSettings() {
 		return "0"
 	}
 	lines := []string{
+		"name=" + cleanName(getText(hName)),
 		"host=" + getText(hHost),
 		"port=" + getText(hPort),
 		"fps=" + strconv.Itoa(comboValue(hFPS, fpsChoices)),
@@ -739,7 +761,6 @@ func saveSettings() {
 		"clipboard=" + b(checked(hClip)),
 		"video=" + b(checked(hVideo)),
 		"fastcapture=" + b(checked(hFast)),
-		"display=" + strconv.Itoa(wantedDisplay),
 		"remember=" + b(checked(hRemember)),
 	}
 	if checked(hRemember) {
@@ -754,6 +775,7 @@ func saveSettings() {
 
 func loadSettings() {
 	var lastPassword []byte
+	oldDisplay := noPreference // from before each connection kept its own
 	data, err := os.ReadFile(settingsPath())
 	if err != nil {
 		return
@@ -765,6 +787,8 @@ func loadSettings() {
 		}
 		n, _ := strconv.Atoi(v)
 		switch k {
+		case "name":
+			setText(hName, v)
 		case "host":
 			setText(hHost, v)
 		case "port":
@@ -787,7 +811,7 @@ func loadSettings() {
 			setChecked(hFast, v == "1")
 		case "display":
 			if n >= -1 && n < 16 && v != "" {
-				wantedDisplay = n
+				oldDisplay = n
 			}
 		case "remember":
 			setChecked(hRemember, v == "1")
@@ -798,16 +822,29 @@ func loadSettings() {
 					setText(hPass, string(pw))
 				}
 			}
-		case "computer":
+		case "computer": // saved before connections had names
+			before := len(computers)
 			parseComputer(v)
+			if len(computers) > before {
+				computers[before].display = oldDisplay
+			}
+		case "connection":
+			parseConnection(v)
 		}
 	}
 	// Settings from before there was a list held one computer: start the
 	// list with it.
-	if host := getText(hHost); host != "" && findComputer(host) < 0 {
-		computers = append(computers, computer{host: host, port: getText(hPort), password: lastPassword})
+	if host := getText(hHost); host != "" && len(computers) == 0 {
+		computers = append(computers, computer{name: host, host: host, port: getText(hPort), password: lastPassword, display: oldDisplay})
+	}
+	if getText(hName) == "" {
+		setText(hName, getText(hHost))
 	}
 	fillComputers()
+	if i := findComputer(cleanName(getText(hName))); i >= 0 {
+		pickedName = computers[i].name
+		loadProfile(i)
+	}
 	audioOn.Store(checked(hAudio))
 	clipOn.Store(checked(hClip))
 }
@@ -855,10 +892,10 @@ func onConnectDone() {
 	applySettings()
 	setText(hConnect, "Disconnect")
 	refreshVersionLine()
-	displayRequested = false
+	displayRequested, resRequested = false, false
 	pEnableWindow.Call(hSend, 1)
 	pEnableWindow.Call(hFullscreen, 1)
-	setStatus("Connected to " + l.host + ".\r\n\r\nClick the remote screen to type on the remote PC. Click in this pane to get your own keyboard back." + videoNote())
+	setStatus("Connected to " + l.name + ".\r\n\r\nClick the remote screen to type on the remote PC. Click in this pane to get your own keyboard back." + videoNote())
 	if backToFullscreen {
 		toggleFullscreen()
 	}
@@ -885,6 +922,8 @@ func onDisconnected(id uintptr) {
 	pEnableWindow.Call(hSend, 0)
 	remoteDisplays.Store(nil)
 	showDisplays()
+	remoteModes.Store(nil)
+	showResolutions()
 	pEnableWindow.Call(hFullscreen, 0)
 	serverVersion.Store(nil)
 	setTitle("Deskbridge")
@@ -903,7 +942,7 @@ func onDisconnected(id uintptr) {
 		reconnecting, attempt, restoreFullscreen = true, 0, wasFullscreen
 		scheduleReconnect()
 	case replaced.Load():
-		setStatus("Disconnected: another PC connected to " + l.host + " and took over.")
+		setStatus("Disconnected: another PC connected to " + l.name + " and took over.")
 		openPane()
 	default:
 		openPane() // so Connect is within reach
@@ -1136,7 +1175,7 @@ func receiver(l *link) {
 	defer close(jobs)
 	var audio player
 	defer audio.close()
-	video := videoSink{host: l.host, restart: func() {
+	video := videoSink{host: l.name, restart: func() {
 		select {
 		case l.bulk <- [2][]byte{{proto.MsgVideoRestart}, nil}:
 		case <-l.done:
@@ -1193,6 +1232,11 @@ func receiver(l *link) {
 			if d := parseDisplays(p); d != nil {
 				remoteDisplays.Store(d)
 				pPostMessage.Call(hMain, wmMonitors, 0, 0)
+			}
+		case proto.MsgModes:
+			if m := parseModes(p); m != nil {
+				remoteModes.Store(m)
+				pPostMessage.Call(hMain, wmModes, 0, 0)
 			}
 		case proto.MsgUpdateResult:
 			select {
@@ -1263,6 +1307,10 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 		showDisplays()
 		return 0
 	}
+	if message == wmModes {
+		showResolutions()
+		return 0
+	}
 	switch message {
 	case wmSize:
 		layout()
@@ -1285,14 +1333,16 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 			} else {
 				startConnect()
 			}
-		case id == idHost && code == 1: // CBN_SELCHANGE: a saved computer was picked
+		case id == idName && code == 1: // CBN_SELCHANGE: a saved connection was picked
 			computerPicked()
-		case id == idHost && code == 5: // CBN_EDITCHANGE: typing
+		case id == idName && code == 5: // CBN_EDITCHANGE: typing
 			forgettable := uintptr(0)
-			if findComputer(getText(hHost)) >= 0 {
+			if findComputer(cleanName(getText(hName))) >= 0 {
 				forgettable = 1
 			}
 			pEnableWindow.Call(hForget, forgettable)
+		case id == idResolution && code == 1: // CBN_SELCHANGE
+			resolutionPicked()
 		case id == idForget && code == 0:
 			forgetComputer()
 		case (id == idFPS || id == idQuality) && code == 1, // CBN_SELCHANGE
@@ -1330,7 +1380,7 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 		// A plain window does not hand focus back to a child by itself.
 		target := lastFocus
 		if v, _, _ := pIsWindowVisible.Call(target); target == 0 || target == h || v == 0 {
-			target = hHost
+			target = hName
 			if cur.Load() != nil || collapsed {
 				target = hView
 			}
@@ -1345,7 +1395,7 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 	case wmRemoteSize:
 		if l := cur.Load(); l != nil && l.id == wParam {
 			fbMu.RLock()
-			title := fmt.Sprintf("Deskbridge - %s (%d x %d)", l.host, fbW, fbH)
+			title := fmt.Sprintf("Deskbridge - %s (%d x %d)", l.name, fbW, fbH)
 			fbMu.RUnlock()
 			setTitle(title)
 			pInvalidateRect.Call(hView, 0, 0)

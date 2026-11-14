@@ -12,9 +12,15 @@ carries the programs for Arm and x64 PCs and installs the right ones.
   - Tick what this PC should be:
       Server   the PC you want to control. Setup installs a Windows
                service that starts with the PC and works at the lock
-               screen, opens Windows Firewall for it on private
-               networks, and then shows the computer name, IP address
-               and password to connect with.
+               screen, and shows the computer name, IP address and
+               password to connect with. It also adds a Windows
+               Firewall rule ("Deskbridge server") for private and
+               work networks, checks that the rule is really there,
+               and says so. If the PC's network is set to Public,
+               setup says that too: either tick "Also allow
+               connections while on a public network" (a second rule
+               that lets in only PCs on the same network) or set the
+               network to Private in Windows.
       Client   the PC you sit at. Setup adds Deskbridge to the Start
                menu.
     A PC can be both.
@@ -85,22 +91,44 @@ USING THE CLIENT
   nothing is happening on screen, because the two PCs check on each
   other every couple of seconds.
 
-  Computer / Port / Password   Where to connect. The Computer box is
-                               also a list: every computer you connect
-                               to is saved in it, most recent first,
-                               and picking one fills in its port and
-                               password. Tick "Remember password" to
-                               keep that computer's password (encrypted
-                               for your Windows account).
-  Forget this computer         Removes the computer shown, and its
+  Connection name              What you call this connection, such as
+                               "Office laptop". It is also the list of
+                               saved connections: every one you make
+                               is kept, most recent first, and picking
+                               one fills in everything else. Leave it
+                               empty and the connection is called by
+                               its computer. Typing a new name over a
+                               connection you have named makes a second
+                               connection (handy for the same PC with a
+                               different display or resolution); use
+                               "Forget this connection" on the one you
+                               no longer want.
+  Computer / Port / Password   Where to connect: the remote PC's name
+                               or IP address. Tick "Remember password"
+                               to keep this connection's password
+                               (encrypted for your Windows account).
+  Forget this connection       Removes the connection shown, and its
                                saved password, from the list.
   Remote display               Which of the remote PC's displays to
-                               show, or all of them side by side. The
-                               choice is remembered. The list follows
+                               show, or all of them side by side. Each
+                               connection remembers its own. The list follows
                                displays being plugged in or removed.
                                While the lock screen or an admin prompt
                                is up, all displays are shown, because
                                those can appear on any of them.
+  Remote resolution            Sets the display being shown to another
+                               resolution, for example one that suits
+                               the screen you are sitting at. Choose it
+                               before connecting or while connected;
+                               each connection remembers its own and
+                               applies it when it connects. Only
+                               resolutions that display offers can be
+                               used (the list shows them once you have
+                               connected). The change is temporary: the
+                               remote PC puts its display back a minute
+                               after you disconnect, or at once if you
+                               choose "Leave as it is". Not available
+                               while all displays are shown together.
   Frames per second            Up to 120. This is a ceiling, not a
                                promise: the rate actually arriving is
                                shown at the bottom of the pane. Lower it

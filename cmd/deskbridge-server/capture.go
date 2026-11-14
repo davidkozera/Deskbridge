@@ -28,6 +28,7 @@ import (
 type monitor struct {
 	x, y, w, h int
 	primary    bool
+	device     string // Windows' name for it, such as \\.\DISPLAY1
 }
 
 var (
@@ -40,10 +41,12 @@ var (
 			monitor [4]int32
 			work    [4]int32
 			flags   uint32
-		}{size: 40}
+			device  [32]uint16
+		}{size: 104}
 		if r, _, _ := pGetMonitorInfo.Call(hMonitor, uintptr(unsafe.Pointer(&info))); r != 0 {
 			m := info.monitor
-			monList = append(monList, monitor{int(m[0]), int(m[1]), int(m[2] - m[0]), int(m[3] - m[1]), info.flags&1 != 0})
+			monList = append(monList, monitor{int(m[0]), int(m[1]), int(m[2] - m[0]), int(m[3] - m[1]), info.flags&1 != 0,
+				syscall.UTF16ToString(info.device[:])})
 		}
 		return 1 // keep going
 	})
@@ -141,7 +144,7 @@ func (c *capturer) ensure(choice int) (changed bool, ok bool) {
 		// Could not list displays: fall back to the main one's size.
 		w, _, _ := pGetSystemMetrics.Call(0)
 		h, _, _ := pGetSystemMetrics.Call(1)
-		c.mons = []monitor{{0, 0, int(w), int(h), true}}
+		c.mons = []monitor{{0, 0, int(w), int(h), true, ""}}
 	}
 	var parts []monitor
 	var x, y, w, h int
