@@ -72,9 +72,28 @@ USING THE CLIENT
   saved, the client connects by itself on launch. The pane opens on its
   own when details are missing, a connection fails, or you disconnect.
 
-  Computer / Port / Password   Where to connect. Tick "Remember
-                               password" to keep it (encrypted for your
-                               Windows account) for next time.
+  If a connection is lost (a network blip, the remote PC restarting,
+  this PC waking from sleep), the client reconnects by itself: it tries
+  after 1, 2 and 4 seconds and then every 8, for as long as it takes,
+  and returns to full screen if that is where you were. The same goes
+  for the saved computer at launch if it is not answering yet. To give
+  up, open the pane and click "Stop trying". It does not reconnect after
+  you click Disconnect, if the password is refused, or when another PC
+  connects to the same server and takes over.
+
+  A lost connection is noticed within about eight seconds even when
+  nothing is happening on screen, because the two PCs check on each
+  other every couple of seconds.
+
+  Computer / Port / Password   Where to connect. The Computer box is
+                               also a list: every computer you connect
+                               to is saved in it, most recent first,
+                               and picking one fills in its port and
+                               password. Tick "Remember password" to
+                               keep that computer's password (encrypted
+                               for your Windows account).
+  Forget this computer         Removes the computer shown, and its
+                               saved password, from the list.
   Remote display               Which of the remote PC's displays to
                                show, or all of them side by side. The
                                choice is remembered. The list follows

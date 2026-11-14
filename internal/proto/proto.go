@@ -26,6 +26,7 @@ const (
 	MsgNotice       = 8  // kind u8 (NoticeVideo, NoticeCapture), then UTF-8 text for the client's pane
 	MsgUpdateResult = 9  // ok u8, then text: the server's answer to an update it was sent
 	MsgMonitors     = 10 // selected i8 (-1 = all), count u8, then per display: x i32, y i32, w u32, h u32, flags u8 (1 = main)
+	MsgPong         = 11 // the answer to MsgPing
 )
 
 // Client -> server
@@ -42,6 +43,7 @@ const (
 	MsgUpdateEnd     = 25
 	MsgSelectMonitor = 26 // i8: which display to show, -1 for all of them
 	MsgAction        = 27 // u8: one of the Action values
+	MsgPing          = 28 // "are you there?", sent every couple of seconds
 )
 
 // Things the client can ask the server to do that cannot be done by sending
@@ -58,10 +60,11 @@ const (
 
 // Kinds of notice.
 const (
-	NoticeVideo   = 1 // which video encoder is in use
-	NoticeCapture = 2 // which screen capture method is in use
-	NoticeVersion = 3 // the server's version
-	NoticeGeneral = 4 // something to tell the person, shown as it is
+	NoticeVideo    = 1 // which video encoder is in use
+	NoticeCapture  = 2 // which screen capture method is in use
+	NoticeVersion  = 3 // the server's version
+	NoticeGeneral  = 4 // something to tell the person, shown as it is
+	NoticeReplaced = 5 // another client connected and took this one's place
 )
 
 // Video codecs. The values are also bit positions in the settings message.

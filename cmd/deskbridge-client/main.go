@@ -230,20 +230,25 @@ type kbdllHook struct {
 
 // link is one connection to a server.
 type link struct {
-	id   uintptr
-	c    *proto.Conn
-	host string
-	out  chan [2][]byte // {type, payload}: input, may be dropped if stalled
-	bulk chan [2][]byte // clipboard data: never dropped, yields to input
-	done chan struct{}
-	once sync.Once
+	id    uintptr
+	c     *proto.Conn
+	host  string
+	out   chan [2][]byte // {type, payload}: input, may be dropped if stalled
+	bulk  chan [2][]byte // clipboard data: never dropped, yields to input
+	done  chan struct{}
+	once  sync.Once
+	heard atomic.Int64 // when anything last arrived from the server
+	pong  atomic.Bool  // the server answers pings, so silence means the link is dead
 }
 
 func (l *link) close() { l.once.Do(func() { close(l.done); l.c.Close() }) }
 
 type connectResult struct {
-	l   *link
-	err string
+	l           *link
+	err         string
+	badPassword bool
+	auto        bool // an attempt made by reconnecting
+	target      target
 }
 
 var (
@@ -402,7 +407,7 @@ func main() {
 	hView, _, _ = pCreateWindowEx.Call(0, uintptr(unsafe.Pointer(viewClass)), 0, wsChild|wsVisible, 0, 0, 10, 10, hMain, 0, inst, 0)
 	loadSettings()
 	startClipboard()
-	user32.NewProc("SetTimer").Call(hMain, 1, 1000, 0) // drives the frame-rate readout
+	pSetTimer.Call(hMain, timerFrameRate, 1000, 0) // drives the frame-rate readout
 	go watchForUpdates()
 	go func() { // finding decoders can take a moment; do not hold up the window
 		var caps uint32
@@ -437,7 +442,7 @@ func main() {
 	pShowWindow.Call(hMain, 1)
 	if ready {
 		pSetFocus.Call(hView)
-		startConnect()
+		connectAtLaunch()
 	} else {
 		pSetFocus.Call(hHost)
 	}
@@ -509,14 +514,18 @@ func buildPane() {
 		return h
 	}
 
-	label("Computer name or IP address")
-	hHost = edit(0)
+	label("Computer (name or IP address)")
+	// Type a new one, or pick a saved one from the list.
+	hHost = control("COMBOBOX", "", 0x2|0x40|wsVScroll|wsTabStop, 0, m, y, w, 240, idHost)
+	y += 34
 	label("Port")
 	hPort = edit(esNumber)
 	label("Password")
 	hPass = edit(esPassword)
 	hRemember = check(idRemember, "Remember password")
-	y += 4
+	hForget = control("BUTTON", "Forget this computer", wsTabStop, 0, m, y, w, 26, idForget)
+	pEnableWindow.Call(hForget, 0)
+	y += 34
 	hConnect = control("BUTTON", "Connect", bsDefPush|wsTabStop, 0, m, y, w, 32, idConnect)
 	y += 50
 
@@ -738,11 +747,13 @@ func saveSettings() {
 			lines = append(lines, "password="+hex.EncodeToString(enc))
 		}
 	}
+	lines = append(lines, computerLines()...)
 	os.MkdirAll(filepath.Dir(path), 0700)
 	os.WriteFile(path, []byte(strings.Join(lines, "\r\n")+"\r\n"), 0600)
 }
 
 func loadSettings() {
+	var lastPassword []byte
 	data, err := os.ReadFile(settingsPath())
 	if err != nil {
 		return
@@ -782,60 +793,26 @@ func loadSettings() {
 			setChecked(hRemember, v == "1")
 		case "password":
 			if enc, err := hex.DecodeString(v); err == nil {
+				lastPassword = enc
 				if pw := dpapi(pCryptUnprotectData, enc); pw != nil {
 					setText(hPass, string(pw))
 				}
 			}
+		case "computer":
+			parseComputer(v)
 		}
 	}
+	// Settings from before there was a list held one computer: start the
+	// list with it.
+	if host := getText(hHost); host != "" && findComputer(host) < 0 {
+		computers = append(computers, computer{host: host, port: getText(hPort), password: lastPassword})
+	}
+	fillComputers()
 	audioOn.Store(checked(hAudio))
 	clipOn.Store(checked(hClip))
 }
 
 // ---------- connecting ----------
-
-func startConnect() {
-	if connecting || cur.Load() != nil {
-		return
-	}
-	host, port, password := getText(hHost), getText(hPort), getText(hPass)
-	if host == "" || password == "" {
-		setStatus("Enter the computer name and the password first.")
-		return
-	}
-	if port == "" {
-		port = proto.DefaultPort
-	}
-	connecting = true
-	pEnableWindow.Call(hConnect, 0)
-	setStatus("Connecting to " + host + "...")
-	nextLinkID++
-	id := nextLinkID
-	go func() {
-		res := &connectResult{}
-		addr := net.JoinHostPort(host, port)
-		nc, err := net.DialTimeout("tcp", addr, 8*time.Second)
-		if err != nil {
-			res.err = "Could not reach " + addr + ".\r\n\r\nCheck that Deskbridge is running on that PC and that both PCs are on the same network."
-		} else {
-			if tc, ok := nc.(*net.TCPConn); ok {
-				tc.SetNoDelay(true)
-			}
-			tc, err := proto.ClientHandshake(nc, proto.DeriveKey(password))
-			if errors.Is(err, proto.ErrAuth) {
-				nc.Close()
-				res.err = "Wrong password."
-			} else if err != nil {
-				nc.Close()
-				res.err = "Connection failed: " + err.Error()
-			} else {
-				res.l = &link{id: id, c: proto.NewConn(tc), host: host, out: make(chan [2][]byte, 2048), bulk: make(chan [2][]byte, 2), done: make(chan struct{})}
-			}
-		}
-		connectRes.Store(res)
-		pPostMessage.Call(hMain, wmConnectDone, 0, 0)
-	}()
-}
 
 func onConnectDone() {
 	res := connectRes.Swap(nil)
@@ -844,15 +821,37 @@ func onConnectDone() {
 	}
 	connecting = false
 	pEnableWindow.Call(hConnect, 1)
+	if res.auto && !reconnecting {
+		// The person stopped reconnecting while this attempt was under way.
+		if res.l != nil {
+			res.l.close()
+		}
+		return
+	}
 	if res.l == nil {
-		setStatus(res.err)
-		openPane() // so the reason is visible
+		switch {
+		case reconnecting && res.badPassword:
+			stopReconnect("Reconnecting stopped: the password was not accepted. It may have been changed on that PC.")
+		case reconnecting:
+			scheduleReconnect()
+		default:
+			setStatus(res.err)
+			openPane() // so the reason is visible
+		}
 		return
 	}
 	l := res.l
+	backToFullscreen := reconnecting && restoreFullscreen
+	reconnecting, attempt, viewNote, restoreFullscreen, userClosed = false, 0, "", false, false
+	replaced.Store(false)
+	lastTarget, haveTarget, everConnected = res.target, true, true
+	if !res.auto {
+		rememberComputer(res.target)
+	}
 	cur.Store(l)
 	go sender(l)
 	go receiver(l)
+	go heartbeat(l)
 	applySettings()
 	setText(hConnect, "Disconnect")
 	refreshVersionLine()
@@ -860,6 +859,9 @@ func onConnectDone() {
 	pEnableWindow.Call(hSend, 1)
 	pEnableWindow.Call(hFullscreen, 1)
 	setStatus("Connected to " + l.host + ".\r\n\r\nClick the remote screen to type on the remote PC. Click in this pane to get your own keyboard back." + videoNote())
+	if backToFullscreen {
+		toggleFullscreen()
+	}
 	pSetFocus.Call(hView)
 }
 
@@ -871,6 +873,7 @@ func onDisconnected(id uintptr) {
 	cur.Store(nil)
 	l.close()
 	clear(pressed)
+	wasFullscreen := fullscreen
 	if fullscreen {
 		toggleFullscreen()
 	}
@@ -893,7 +896,19 @@ func onDisconnected(id uintptr) {
 	}
 	refreshUpdate()
 	pInvalidateRect.Call(hView, 0, 0)
-	openPane() // so Connect is within reach
+	switch {
+	case lostUnexpectedly():
+		// A network blip, the remote PC restarting, this PC waking from
+		// sleep: keep trying, without getting in the way.
+		reconnecting, attempt, restoreFullscreen = true, 0, wasFullscreen
+		scheduleReconnect()
+	case replaced.Load():
+		setStatus("Disconnected: another PC connected to " + l.host + " and took over.")
+		openPane()
+	default:
+		openPane() // so Connect is within reach
+	}
+	userClosed = false
 }
 
 func openPane() {
@@ -1147,6 +1162,7 @@ func receiver(l *link) {
 		if err != nil {
 			return
 		}
+		l.heard.Store(time.Now().UnixNano())
 		switch t {
 		case proto.MsgSize:
 			if len(p) < 8 {
@@ -1171,6 +1187,8 @@ func receiver(l *link) {
 			}
 			wg.Add(1)
 			jobs <- job{p[8], p[9:], r}
+		case proto.MsgPong:
+			l.pong.Store(true)
 		case proto.MsgMonitors:
 			if d := parseDisplays(p); d != nil {
 				remoteDisplays.Store(d)
@@ -1192,6 +1210,8 @@ func receiver(l *link) {
 				v := string(p[1:])
 				serverVersion.Store(&v)
 				pPostMessage.Call(hMain, wmUpdateInfo, 0, 0)
+			case proto.NoticeReplaced:
+				replaced.Store(true)
 			case proto.NoticeGeneral:
 				postStatus(string(p[1:]))
 			case proto.NoticeCapture:
@@ -1255,11 +1275,26 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 				// Enter anywhere in the pane also arrives here; only a
 				// deliberate press of the button itself disconnects.
 				if f, _, _ := pGetFocus.Call(); f == hConnect {
+					userClosed = true
 					l.close() // the receiver notices and reports back
+				}
+			} else if reconnecting {
+				if f, _, _ := pGetFocus.Call(); f == hConnect {
+					stopReconnect("Disconnected.")
 				}
 			} else {
 				startConnect()
 			}
+		case id == idHost && code == 1: // CBN_SELCHANGE: a saved computer was picked
+			computerPicked()
+		case id == idHost && code == 5: // CBN_EDITCHANGE: typing
+			forgettable := uintptr(0)
+			if findComputer(getText(hHost)) >= 0 {
+				forgettable = 1
+			}
+			pEnableWindow.Call(hForget, forgettable)
+		case id == idForget && code == 0:
+			forgetComputer()
 		case (id == idFPS || id == idQuality) && code == 1, // CBN_SELCHANGE
 			(id == idAudio || id == idSleep || id == idRemember || id == idClipboard || id == idVideo || id == idFast) && code == 0:
 			applySettings()
@@ -1348,7 +1383,12 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 	case wmDisconnected:
 		onDisconnected(wParam)
 		return 0
-	case 0x0113: // WM_TIMER, once a second
+	case 0x0113: // WM_TIMER
+		if wParam == timerReconnect {
+			reconnectTimer()
+			return 0
+		}
+		// Otherwise the once-a-second tick behind the frame-rate readout.
 		n := int(framesShown.Swap(0))
 		if cur.Load() == nil {
 			n = -1
@@ -1533,6 +1573,8 @@ func paint(h uintptr) {
 		text := "Not connected"
 		if cur.Load() != nil {
 			text = "Waiting for the remote screen..."
+		} else if viewNote != "" {
+			text = viewNote
 		}
 		old, _, _ := pSelectObject.Call(hdc, hFont)
 		pSetBkMode.Call(hdc, 1)

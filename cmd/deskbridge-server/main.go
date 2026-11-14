@@ -92,6 +92,8 @@ type session struct {
 	restart     atomic.Bool   // the client asked for a fresh video stream
 	fastCapture atomic.Bool
 	monitor     atomic.Int32   // which display to show; -1 for all of them
+	heard       atomic.Int64   // when anything last arrived from the client
+	pinged      atomic.Bool    // the client sends pings, so silence means it is gone
 	update      updateReceiver // used only by the input goroutine
 	done        chan struct{}
 	once        sync.Once
@@ -291,6 +293,9 @@ func serve(nc net.Conn, cfg *tls.Config, key []byte) {
 	s.fastCapture.Store(true)
 	activeMu.Lock()
 	if active != nil {
+		// Tell the client it was replaced, so it does not reconnect and
+		// start a tug of war with the newcomer.
+		active.c.Send(proto.MsgNotice, true, []byte{proto.NoticeReplaced, '.'})
 		active.close()
 	}
 	active = s
@@ -502,6 +507,12 @@ func inputLoop(s *session, peer clipPeer) {
 			peer.Remote(t, p)
 			continue
 		}
+		s.heard.Store(time.Now().UnixNano())
+		if t == proto.MsgPing {
+			s.pinged.Store(true)
+			s.c.Send(proto.MsgPong, true)
+			continue
+		}
 		if t != proto.MsgAck && time.Since(lastSync) > 100*time.Millisecond {
 			desk.sync(nil)
 			lastSync = time.Now()
@@ -648,6 +659,12 @@ func videoLoop(s *session) {
 	u16 := func(v int) []byte { return binary.LittleEndian.AppendUint16(nil, uint16(v)) }
 
 	for !s.closed() {
+		// A client that pings and then falls silent has gone away (asleep,
+		// unplugged, off the network) without the connection noticing.
+		if s.pinged.Load() && time.Since(time.Unix(0, s.heard.Load())) > 15*time.Second {
+			log.Print("client stopped answering; closing the connection")
+			return
+		}
 		if s.pending.Load() >= 2 {
 			time.Sleep(2 * time.Millisecond)
 			continue
