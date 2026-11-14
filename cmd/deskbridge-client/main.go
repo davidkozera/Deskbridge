@@ -57,6 +57,7 @@ var (
 	pGetClientRect       = user32.NewProc("GetClientRect")
 	pGetWindowRect       = user32.NewProc("GetWindowRect")
 	pLoadCursor          = user32.NewProc("LoadCursorW")
+	pLoadIcon            = user32.NewProc("LoadIconW")
 	pSetCursor           = user32.NewProc("SetCursor")
 	pGetCursorPos        = user32.NewProc("GetCursorPos")
 	pSetCapture          = user32.NewProc("SetCapture")
@@ -156,6 +157,7 @@ const (
 	idToggle     = 107
 	idClipboard  = 108
 	idVideo      = 109
+	idFast       = 110
 
 	paneWidth   = 264 // at 96 dpi
 	toggleWidth = 16
@@ -250,7 +252,7 @@ var (
 
 	hHost, hPort, hPass, hRemember, hConnect uintptr
 	hFPS, hQuality, hAudio, hSleep, hClip    uintptr
-	hVideo                                   uintptr
+	hVideo, hFast                            uintptr
 	hFullscreen, hStatus, hToggle            uintptr
 	paneCtls                                 []uintptr
 
@@ -371,7 +373,8 @@ func main() {
 	clipOn.Store(true)
 
 	mainClass, viewClass := u16ptr("DeskbridgeMain"), u16ptr("DeskbridgeView")
-	wc := wndClassEx{wndProc: syscall.NewCallback(mainProc), instance: inst, cursor: arrow,
+	appIcon, _, _ := pLoadIcon.Call(inst, 1) // the icon stamped into the .exe, if any
+	wc := wndClassEx{wndProc: syscall.NewCallback(mainProc), instance: inst, cursor: arrow, icon: appIcon, iconSm: appIcon,
 		background: 16 /* COLOR_BTNFACE+1 */, className: mainClass}
 	wc.size = uint32(unsafe.Sizeof(wc))
 	pRegisterClassEx.Call(uintptr(unsafe.Pointer(&wc)))
@@ -396,6 +399,7 @@ func main() {
 	hView, _, _ = pCreateWindowEx.Call(0, uintptr(unsafe.Pointer(viewClass)), 0, wsChild|wsVisible, 0, 0, 10, 10, hMain, 0, inst, 0)
 	loadSettings()
 	startClipboard()
+	go watchForUpdates()
 	go func() { // finding decoders can take a moment; do not hold up the window
 		var caps uint32
 		for _, c := range []byte{proto.CodecHEVC, proto.CodecH264} {
@@ -520,10 +524,17 @@ func buildPane() {
 	hSleep = check(idSleep, "Let the remote PC go to sleep")
 	hClip = check(idClipboard, "Share copy and paste")
 	hVideo = check(idVideo, "Use H.265 video for motion")
+	hFast = check(idFast, "Fast screen capture")
 	y += 8
 	hFullscreen = control("BUTTON", "Full screen  (Ctrl+Alt+Enter)", wsTabStop, 0, m, y, w, 30, idFullscreen)
+	y += 40
+	// Shown only when a newer version is available (see update.go), so it
+	// is kept out of the list of controls that follow the pane.
+	hUpdate = control("BUTTON", "Update", wsTabStop, 0, m, y, w, 30, idUpdate)
+	paneCtls = paneCtls[:len(paneCtls)-1]
+	pShowWindow.Call(hUpdate, 0)
 	y += 44
-	hStatus = control("STATIC", "Not connected.", 0, 0, m, y, w, 200, 0)
+	hStatus = control("STATIC", "Deskbridge "+proto.Version+"\r\n\r\nNot connected.", 0, 0, m, y, w, 200, 0)
 
 	// The collapse strip is not part of the pane: it stays visible.
 	hToggle, _, _ = pCreateWindowEx.Call(0, uintptr(unsafe.Pointer(u16ptr("BUTTON"))), uintptr(unsafe.Pointer(u16ptr("<"))),
@@ -536,6 +547,7 @@ func buildPane() {
 	setChecked(hAudio, true)
 	setChecked(hClip, true)
 	setChecked(hVideo, true)
+	setChecked(hFast, true)
 	pEnableWindow.Call(hFullscreen, 0)
 }
 
@@ -559,6 +571,14 @@ func layout() {
 			pSetFocus.Call(hView)
 		}
 	}
+	if showPane && updateOffered {
+		pShowWindow.Call(hUpdate, 8)
+	} else {
+		if focus == hUpdate {
+			pSetFocus.Call(hView)
+		}
+		pShowWindow.Call(hUpdate, 0)
+	}
 	x := 0
 	if showPane {
 		x = sc(paneWidth)
@@ -581,7 +601,7 @@ func layout() {
 func setStatus(s string) { setText(hStatus, s) }
 
 func settingsPayload() []byte {
-	b := []byte{byte(comboValue(hFPS, fpsChoices)), byte(comboValue(hQuality, qualityChoices)), 0, 0, 0, 0, 0}
+	b := []byte{byte(comboValue(hFPS, fpsChoices)), byte(comboValue(hQuality, qualityChoices)), 0, 0, 0, 0, 0, 0}
 	if checked(hAudio) {
 		b[2] = 1
 	}
@@ -595,6 +615,9 @@ func settingsPayload() []byte {
 		b[5] = 1
 	}
 	b[6] = byte(videoCaps.Load())
+	if checked(hFast) {
+		b[7] = 1
+	}
 	return b
 }
 
@@ -657,6 +680,7 @@ func saveSettings() {
 		"sleep=" + b(checked(hSleep)),
 		"clipboard=" + b(checked(hClip)),
 		"video=" + b(checked(hVideo)),
+		"fastcapture=" + b(checked(hFast)),
 		"remember=" + b(checked(hRemember)),
 	}
 	if checked(hRemember) {
@@ -698,6 +722,8 @@ func loadSettings() {
 			setChecked(hClip, v == "1")
 		case "video":
 			setChecked(hVideo, v == "1")
+		case "fastcapture":
+			setChecked(hFast, v == "1")
 		case "remember":
 			setChecked(hRemember, v == "1")
 		case "password":
@@ -797,8 +823,15 @@ func onDisconnected(id uintptr) {
 	curCursor.Store(arrow)
 	setText(hConnect, "Connect")
 	pEnableWindow.Call(hFullscreen, 0)
-	setText(hMain, "Deskbridge")
-	setStatus("Disconnected.")
+	serverVersion.Store(nil)
+	setTitle("Deskbridge")
+	if updateNote != "" && time.Since(updateNoteAt) < 3*time.Minute {
+		// Expected: the remote PC is restarting for its update.
+		setStatus(updateNote + "\r\n\r\nDisconnected. Click Connect in a few seconds.")
+	} else {
+		setStatus("Disconnected.")
+	}
+	refreshUpdate()
 	pInvalidateRect.Call(hView, 0, 0)
 	openPane() // so Connect is within reach
 }
@@ -872,12 +905,27 @@ type videoSink struct {
 	failed    bool   // ignore video until the server starts a new stream
 	announced bool   // said which decoder is in use
 	notice    string // what the server said about its encoder
+	capture   string // what the server said about its screen capture
+	decoded   string // how video is being decoded here, once known
+	host      string
 	restart   func() // asks the server for a new stream
 	// The changed areas that came with the last few frames. Only those are
 	// redrawn from video, so the rest of the screen stays pixel-perfect. A
 	// few frames' worth are kept because a decoder may hand pictures back a
 	// frame or two late.
 	recent [3][]proto.Rect
+}
+
+// report is the pane's summary of how the picture is being produced.
+func (v *videoSink) report() string {
+	s := "Connected to " + v.host + "."
+	if v.capture != "" {
+		s += "\r\n\r\n" + v.capture
+	}
+	if v.decoded != "" {
+		s += "\r\n\r\n" + v.decoded
+	}
+	return s + "\r\n\r\nClick the remote screen to type there; click in this pane to type here."
 }
 
 func (v *videoSink) close() {
@@ -966,7 +1014,8 @@ func (v *videoSink) handle(p []byte) {
 		if v.dec.OnGPU() {
 			where = "on the graphics card"
 		}
-		postStatus(v.notice + "\r\n\r\nDecoded here " + where + " by: " + v.dec.Name + ".")
+		v.decoded = v.notice + " Decoded here " + where + " by: " + v.dec.Name + "."
+		postStatus(v.report())
 	}
 }
 
@@ -1012,7 +1061,7 @@ func receiver(l *link) {
 	defer close(jobs)
 	var audio player
 	defer audio.close()
-	video := videoSink{restart: func() {
+	video := videoSink{host: l.host, restart: func() {
 		select {
 		case l.bulk <- [2][]byte{{proto.MsgVideoRestart}, nil}:
 		case <-l.done:
@@ -1062,9 +1111,25 @@ func receiver(l *link) {
 			}
 			wg.Add(1)
 			jobs <- job{p[8], p[9:], r}
+		case proto.MsgUpdateResult:
+			select {
+			case updateResult <- p:
+			default:
+			}
 		case proto.MsgNotice:
-			if len(p) <= 600 {
-				video.notice = string(p)
+			if len(p) < 2 || len(p) > 600 {
+				continue
+			}
+			switch p[0] {
+			case proto.NoticeVideo:
+				video.notice = string(p[1:])
+			case proto.NoticeVersion:
+				v := string(p[1:])
+				serverVersion.Store(&v)
+				pPostMessage.Call(hMain, wmUpdateInfo, 0, 0)
+			case proto.NoticeCapture:
+				video.capture = string(p[1:])
+				postStatus(video.report())
 			}
 		case proto.MsgVideo:
 			wg.Wait() // anything drawn before this frame must land first
@@ -1103,6 +1168,9 @@ func receiver(l *link) {
 // ---------- main window ----------
 
 func mainProc(h, message, wParam, lParam uintptr) uintptr {
+	if updateMessage(message, wParam) {
+		return 0
+	}
 	switch message {
 	case wmSize:
 		layout()
@@ -1121,12 +1189,14 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 				startConnect()
 			}
 		case (id == idFPS || id == idQuality) && code == 1, // CBN_SELCHANGE
-			(id == idAudio || id == idSleep || id == idRemember || id == idClipboard || id == idVideo) && code == 0:
+			(id == idAudio || id == idSleep || id == idRemember || id == idClipboard || id == idVideo || id == idFast) && code == 0:
 			applySettings()
 		case id == idFullscreen && code == 0:
 			if cur.Load() != nil {
 				toggleFullscreen()
 			}
+		case id == idUpdate && code == 0:
+			startUpdate()
 		case id == idToggle && code == 0:
 			collapsed = !collapsed
 			layout()
@@ -1166,7 +1236,7 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 			fbMu.RLock()
 			title := fmt.Sprintf("Deskbridge - %s (%d x %d)", l.host, fbW, fbH)
 			fbMu.RUnlock()
-			setText(h, title)
+			setTitle(title)
 			pInvalidateRect.Call(hView, 0, 0)
 		}
 		return 0
@@ -1192,7 +1262,11 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 		return 0
 	case wmStatus:
 		if s := statusText.Swap(nil); s != nil && cur.Load() != nil {
-			setStatus(*s)
+			text := *s
+			if strings.HasPrefix(text, "Connected to ") {
+				text += videoNote() // e.g. that this PC lacks an H.265 decoder
+			}
+			setStatus(text)
 		}
 		return 0
 	case wmDisconnected:

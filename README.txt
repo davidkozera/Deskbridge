@@ -2,37 +2,65 @@ DESKBRIDGE
 Share a signed-in Windows desktop (screen, mouse, keyboard, sound) with
 another PC on the same network. No Windows account password is involved.
 
-FILES
-  deskbridge-server.exe   For the PC you want to control (Windows on Arm).
-  Install Deskbridge service.cmd / Uninstall Deskbridge service.cmd
-                          Double-click on the Arm PC to add or remove the
-                          startup service.
-  deskbridge-client.exe   For the PC you sit at (Windows x64).
-  deskbridge-source.zip   Source code (Go, standard library only).
+INSTALLING
+Run Deskbridge-Setup.exe on each PC. The same file works on both; it
+carries the programs for Arm and x64 PCs and installs the right ones.
 
-SET UP (RUNS AT STARTUP, WORKS AT THE LOCK SCREEN)
-1. On the Arm PC, put deskbridge-server.exe and the two .cmd files in
-   the same folder and double-click "Install Deskbridge service.cmd".
-   - Windows SmartScreen may warn about an unknown publisher: choose
-     "More info" > "Run anyway".
-   - Approve the administrator prompt.
-   - The window shows the computer name, IP address and password.
-   The installer copies the server to C:\Program Files\Deskbridge,
-   registers a Windows service that starts with the PC, and allows it
-   through Windows Firewall on private networks. If you were already
-   using the server from this folder, your existing password is kept.
-   Close any server window that is still open before installing.
-2. On the x64 PC, run deskbridge-client.exe, fill in the computer name
-   (or IP address) and password in the left pane, and click Connect.
+  - Windows SmartScreen may warn about an unknown publisher (the setup
+    program is not code-signed): choose "More info" > "Run anyway".
+  - Approve the administrator prompt.
+  - Tick what this PC should be:
+      Server   the PC you want to control. Setup installs a Windows
+               service that starts with the PC and works at the lock
+               screen, opens Windows Firewall for it on private
+               networks, and then shows the computer name, IP address
+               and password to connect with.
+      Client   the PC you sit at. Setup adds Deskbridge to the Start
+               menu.
+    A PC can be both.
+  - Click Install.
 
-To remove it, double-click "Uninstall Deskbridge service.cmd".
+Everything goes in C:\Program Files\Deskbridge.
+
+To update, use the Update button (see UPDATING below), or run a newer
+Deskbridge-Setup.exe and click Install again. Either way the password
+and the client's settings are kept.
+
+To remove it, use Settings > Apps > Installed apps > Deskbridge, or run
+setup again and click Uninstall.
+
 To change the password, edit deskbridge-password.txt in
 C:\Program Files\Deskbridge as an administrator, then restart the PC.
 
-WITHOUT INSTALLING
-Double-click deskbridge-server.exe instead. It shares the desktop until
-you close its window, but cannot show the lock screen or admin approval
-prompts.
+The version number is shown in setup's title, in the client's pane
+before connecting, and in each program's Properties > Details.
+
+UPDATING
+  New versions are published at
+  https://github.com/davidkozera/Deskbridge/releases
+
+  The client checks there when it starts. When a newer version exists,
+  or the remote PC runs an older version than this one, an Update
+  button appears in the left pane and the window title says an update
+  is available. One click then:
+
+    1. downloads the new setup program and checks its signature;
+    2. if you are connected, sends it to the remote PC, which checks
+       the signature itself and installs it (the connection drops for
+       a few seconds while its service restarts);
+    3. updates this PC. Windows asks for administrator approval once;
+       the client then closes and reopens by itself.
+
+  Connect first if you want both PCs updated in one go. If you were not
+  connected, the button comes back the next time you connect, to bring
+  the remote PC up to date.
+
+  - Updates are only accepted if they carry the publisher's signature,
+    so a tampered or unofficial setup program is refused on both PCs.
+  - A server that was started by hand (not installed) cannot update
+    itself; run setup on that PC instead.
+  - What an update did is recorded in update.log in
+    C:\Program Files\Deskbridge.
 
 USING THE CLIENT
   The left pane holds every setting; the remote screen is on the right.
@@ -57,6 +85,14 @@ USING THE CLIENT
                                restarts.
   Share copy and paste         See COPY AND PASTE below.
   Use H.265 video for motion   See VIDEO FOR MOTION below.
+  Fast screen capture          The Arm PC takes frames straight from its
+                               graphics card, and only when the screen
+                               changes: smoother, and far less work when
+                               idle. The pane shows "Screen capture:
+                               fast" when it is in use. If the picture
+                               misbehaves, untick it to go back to the
+                               standard method; Deskbridge also falls
+                               back by itself if fast capture fails.
   Full screen                  Also Ctrl+Alt+Enter, which is the way
                                back out.
 
@@ -139,8 +175,11 @@ LIMITS
 TROUBLESHOOTING
   The service writes deskbridge.log in C:\Program Files\Deskbridge.
 
-SERVER OPTIONS (when run without installing; all optional.
-The client's settings override fps, quality, audio and sleep.)
+RUNNING THE SERVER WITHOUT INSTALLING
+  deskbridge-server.exe can also be started by hand from a command
+  prompt. It then shares the desktop until its window is closed, but
+  cannot show the lock screen or admin approval prompts. Options (the
+  client's settings override fps, quality, audio and sleep):
   -port 47600      TCP port
   -password X      use this password instead of the saved one
   -fps 30          maximum frames per second
@@ -156,11 +195,16 @@ SECURITY
   do not forward the port to the internet. Only administrators can read
   the installed password file.
 
-REBUILDING
-  Install Go 1.24 or later, unzip the source, then:
-    set CGO_ENABLED=0
-    set GOOS=windows
-    set GOARCH=arm64
-    go build -o deskbridge-server.exe ./cmd/deskbridge-server
-    set GOARCH=amd64
-    go build -o deskbridge-client.exe ./cmd/deskbridge-client
+REBUILDING AND PUBLISHING
+  The source is Go, standard library only. Install Go 1.24 or later and
+  run build.sh from the source folder (on Windows, in Git Bash). It
+  builds the server and client for both processor types, stamps them
+  with the icon and the version in the VERSION file, and packs them
+  into dist/Deskbridge-Setup-<version>.exe.
+
+  Publishing is automatic: when the VERSION file changes on the main
+  branch, GitHub builds the setup program, signs it and publishes it as
+  a release (.github/workflows/release.yml). Signing uses the private
+  key stored as the repository secret UPDATE_SIGNING_KEY; its public
+  half is in internal/update/key.go. A setup program built by hand is
+  not signed, so it installs normally but is not offered as an update.

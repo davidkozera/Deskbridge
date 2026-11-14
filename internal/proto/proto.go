@@ -16,14 +16,15 @@ const DefaultPort = "47600"
 
 // Server -> client
 const (
-	MsgSize     = 1 // w u32, h u32
-	MsgRect     = 2 // x,y,w,h u16, enc u8, data
-	MsgFrameEnd = 3
-	MsgCursor   = 4 // system cursor id u16
-	MsgAudioFmt = 5 // sample rate u32 (always 16-bit stereo)
-	MsgAudio    = 6 // s16le stereo PCM
-	MsgVideo    = 7 // flags u8 (1=key frame, 2=new stream), codec u8, w u16, h u16, n u16, n changed areas (x,y,w,h u16), one encoded frame
-	MsgNotice   = 8 // UTF-8 text for the client to show in its pane
+	MsgSize         = 1 // w u32, h u32
+	MsgRect         = 2 // x,y,w,h u16, enc u8, data
+	MsgFrameEnd     = 3
+	MsgCursor       = 4 // system cursor id u16
+	MsgAudioFmt     = 5 // sample rate u32 (always 16-bit stereo)
+	MsgAudio        = 6 // s16le stereo PCM
+	MsgVideo        = 7 // flags u8 (1=key frame, 2=new stream), codec u8, w u16, h u16, n u16, n changed areas (x,y,w,h u16), one encoded frame
+	MsgNotice       = 8 // kind u8 (NoticeVideo, NoticeCapture), then UTF-8 text for the client's pane
+	MsgUpdateResult = 9 // ok u8, then text: the server's answer to an update it was sent
 )
 
 // Client -> server
@@ -33,8 +34,18 @@ const (
 	MsgMouseBtn     = 18 // button u8 (0=L 1=R 2=M 3=X1 4=X2), down u8, x,y u16
 	MsgWheel        = 19 // delta i16, horizontal u8
 	MsgKey          = 20 // vk u16, scan u16, flags u8 (1=extended, 2=up)
-	MsgSettings     = 21 // fps u8, quality u8, audio on u8, allow sleep u8, clipboard on u8, video on u8, decodable codecs u8 (bit per codec)
+	MsgSettings     = 21 // fps u8, quality u8, audio on u8, allow sleep u8, clipboard on u8, video on u8, decodable codecs u8 (bit per codec), fast capture u8
 	MsgVideoRestart = 22 // the client lost its decoder: begin a new video stream
+	MsgUpdateBegin  = 23 // "version\nsignature\nsize": a signed setup program follows, for the server to install
+	MsgUpdateData   = 24 // bytes of the setup program
+	MsgUpdateEnd    = 25
+)
+
+// Kinds of notice.
+const (
+	NoticeVideo   = 1 // which video encoder is in use
+	NoticeCapture = 2 // which screen capture method is in use
+	NoticeVersion = 3 // the server's version
 )
 
 // Video codecs. The values are also bit positions in the settings message.

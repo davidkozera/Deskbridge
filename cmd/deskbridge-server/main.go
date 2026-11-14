@@ -76,17 +76,19 @@ const passwordFile = "deskbridge-password.txt"
 var workerMode bool
 
 type session struct {
-	c       *proto.Conn
-	pending atomic.Int32
-	fps     atomic.Int32 // these three can be changed live by the client
-	quality atomic.Int32
-	audioOn atomic.Bool
-	clipOn  atomic.Bool
-	videoOn atomic.Bool   // client wants motion sent as video
-	codecs  atomic.Uint32 // which video codecs the client can decode
-	restart atomic.Bool   // the client asked for a fresh video stream
-	done    chan struct{}
-	once    sync.Once
+	c           *proto.Conn
+	pending     atomic.Int32
+	fps         atomic.Int32 // these three can be changed live by the client
+	quality     atomic.Int32
+	audioOn     atomic.Bool
+	clipOn      atomic.Bool
+	videoOn     atomic.Bool   // client wants motion sent as video
+	codecs      atomic.Uint32 // which video codecs the client can decode
+	restart     atomic.Bool   // the client asked for a fresh video stream
+	fastCapture atomic.Bool
+	update      updateReceiver // used only by the input goroutine
+	done        chan struct{}
+	once        sync.Once
 }
 
 func (s *session) close() {
@@ -113,12 +115,19 @@ var (
 
 func main() {
 	if len(os.Args) > 1 {
+		for _, a := range os.Args[2:] {
+			quiet = quiet || a == "quiet"
+		}
 		switch os.Args[1] {
-		case "install":
-			install()
-			return
-		case "uninstall":
-			uninstall()
+		case "install", "uninstall":
+			if os.Args[1] == "install" {
+				install()
+			} else {
+				uninstall()
+			}
+			if quiet && !installOK {
+				os.Exit(1)
+			}
 			return
 		case "service":
 			runService()
@@ -153,7 +162,7 @@ func main() {
 	go powerLoop()
 	startClipboard()
 	if workerMode {
-		log.Printf("worker listening on port %s", *flagPort)
+		log.Printf("worker %s listening on port %s", proto.Version, *flagPort)
 		for {
 			nc, err := ln.Accept()
 			if err != nil {
@@ -164,7 +173,7 @@ func main() {
 	}
 
 	host, _ := os.Hostname()
-	fmt.Println("Deskbridge server is running.")
+	fmt.Println("Deskbridge server", proto.Version, "is running.")
 	fmt.Println()
 	fmt.Println("  Connect to:", host)
 	for _, ip := range localIPs() {
@@ -273,6 +282,7 @@ func serve(nc net.Conn, cfg *tls.Config, key []byte) {
 	s.quality.Store(int32(*flagQuality))
 	s.audioOn.Store(true)
 	s.clipOn.Store(true)
+	s.fastCapture.Store(true)
 	activeMu.Lock()
 	if active != nil {
 		active.close()
@@ -491,6 +501,9 @@ func inputLoop(s *session, peer clipPeer) {
 			s.quality.Store(int32(p[1]))
 			s.audioOn.Store(p[2] != 0)
 			allowSleep.Store(p[3] != 0)
+			if len(p) >= 8 {
+				s.fastCapture.Store(p[7] != 0)
+			}
 			if len(p) >= 7 {
 				s.videoOn.Store(p[5] != 0)
 				s.codecs.Store(uint32(p[6]))
@@ -501,6 +514,8 @@ func inputLoop(s *session, peer clipPeer) {
 					clipRelayState(clipEnabled())
 				}
 			}
+		case proto.MsgUpdateBegin, proto.MsgUpdateData, proto.MsgUpdateEnd:
+			s.update.handle(s, t, p)
 		case proto.MsgVideoRestart:
 			s.restart.Store(true)
 		case proto.MsgMouseMove:
@@ -576,16 +591,34 @@ type capturer struct {
 	w, h                         int
 	screenDC, memDC, bmp, oldBmp uintptr
 	pix                          []byte
+
+	// Fast capture (see dda.go). The standard method above stays set up as
+	// the fallback and shares the same pixel buffer.
+	dup      *dda
+	live     bool          // pix holds a picture from dup, so "nothing changed" can be trusted
+	fast     bool          // the last picture came from fast capture
+	dupRetry time.Time     // when to next try creating dup after a failure
+	dupDelay time.Duration // doubles with each failure in a row
+	dupNote  string        // last thing logged, to avoid repeats
+}
+
+func (c *capturer) dropDup() {
+	if c.dup != nil {
+		c.dup.close()
+		c.dup, c.live = nil, false
+	}
 }
 
 func (c *capturer) free() {
+	c.dropDup()
+	keep := capturer{dupRetry: c.dupRetry, dupDelay: c.dupDelay, dupNote: c.dupNote, fast: c.fast}
+	defer func() { *c = keep }()
 	if c.memDC != 0 {
 		pSelectObject.Call(c.memDC, c.oldBmp)
 		pDeleteObject.Call(c.bmp)
 		pDeleteDC.Call(c.memDC)
 		pReleaseDC.Call(0, c.screenDC)
 	}
-	*c = capturer{}
 }
 
 // ensure (re)creates the capture surface when the resolution changes.
@@ -623,11 +656,54 @@ func (c *capturer) ensure() (changed bool, ok bool) {
 	return true, true
 }
 
-func (c *capturer) grab() bool {
+// grab captures the screen into c.pix. With fast it uses Desktop Duplication
+// when that works, waiting up to waitMs for the screen to change; same then
+// reports that it has not, and c.pix is as it was. Otherwise, and whenever
+// fast capture is unavailable, it copies the screen the standard way.
+func (c *capturer) grab(fast bool, waitMs int) (same, ok bool) {
+	now := time.Now()
+	if !fast {
+		c.dropDup()
+	} else if c.dup == nil && now.After(c.dupRetry) {
+		d, err := newDDA()
+		if err != nil {
+			c.dupDelay = min(max(c.dupDelay*2, time.Second), time.Minute)
+			c.dupRetry = now.Add(c.dupDelay)
+			if note := err.Error(); note != c.dupNote {
+				c.dupNote = note
+				log.Printf("capture: fast capture unavailable, using the standard method: %v", err)
+			}
+		} else {
+			c.dup = d
+			if c.dupNote != "fast" {
+				c.dupNote = "fast"
+				log.Print("capture: using fast capture (Desktop Duplication)")
+			}
+		}
+	}
+	if c.dup != nil {
+		switch c.dup.grab(c.pix, c.w, c.h, waitMs) {
+		case ddaFrame:
+			c.live, c.fast, c.dupDelay = true, true, 0
+			return false, true
+		case ddaSame:
+			if c.live {
+				return true, true
+			}
+			// No first picture from it yet: use the standard method meanwhile.
+		default:
+			// Lost: normal when the desktop or display mode changes. Make a
+			// new one shortly, backing off if it keeps happening.
+			c.dropDup()
+			c.dupDelay = min(max(c.dupDelay*2, 250*time.Millisecond), time.Minute)
+			c.dupRetry = now.Add(c.dupDelay)
+		}
+	}
 	// SRCCOPY | CAPTUREBLT
 	r, _, _ := pBitBlt.Call(c.memDC, 0, 0, uintptr(c.w), uintptr(c.h), c.screenDC, 0, 0, 0x00CC0020|0x40000000)
 	pGdiFlush.Call()
-	return r != 0
+	c.live, c.fast = false, false
+	return false, r != 0
 }
 
 type cursorInfo struct {
@@ -658,6 +734,10 @@ func videoLoop(s *session) {
 	var prev []byte
 	vid := newMotionVideo(s)
 	defer vid.close()
+	recheck := false  // compare with the last frame even if the screen has not changed
+	toldFast := false // which capture method the client was last told about
+	s.c.Send(proto.MsgNotice, false, append([]byte{proto.NoticeVersion}, proto.Version...))
+	s.c.Send(proto.MsgNotice, false, append([]byte{proto.NoticeCapture}, "Screen capture: standard."...))
 	sem := make(chan struct{}, runtime.NumCPU())
 	u16 := func(v int) []byte { return binary.LittleEndian.AppendUint16(nil, uint16(v)) }
 
@@ -671,7 +751,19 @@ func videoLoop(s *session) {
 		quality := int(min(max(s.quality.Load(), 1), 100))
 		desk.sync(c.free) // freeing forces a fresh capture surface and a full frame
 		changed, ok := c.ensure()
-		if !ok || !c.grab() {
+		same := false
+		if ok {
+			same, ok = c.grab(s.fastCapture.Load(), int(min(interval, 40*time.Millisecond)/time.Millisecond))
+		}
+		if ok && c.fast != toldFast {
+			toldFast = c.fast
+			note := "Screen capture: standard."
+			if c.fast {
+				note = "Screen capture: fast."
+			}
+			s.c.Send(proto.MsgNotice, false, append([]byte{proto.NoticeCapture}, note...))
+		}
+		if !ok {
 			// On a secure desktop we cannot open (not running as the
 			// service), or mid display change.
 			time.Sleep(250 * time.Millisecond)
@@ -702,10 +794,17 @@ func videoLoop(s *session) {
 			}
 		}
 
-		rects := proto.DirtyRects(c.pix, prev, c.w, c.h, 64)
+		var rects []proto.Rect
+		if !same || prev == nil || recheck {
+			// Fast capture already knows when nothing changed; otherwise
+			// compare with the last frame sent.
+			rects = proto.DirtyRects(c.pix, prev, c.w, c.h, 64)
+			recheck = false
+		}
 		switch vid.decide(rects, c.w, c.h, prev == nil, interval, quality) {
 		case leaveVideo:
 			vid.markForRedraw(prev, c.w) // the next pass redraws, crisply, what video drew
+			recheck = true               // even if the screen itself does not change again
 			continue
 		case useVideo:
 			if len(rects) > 0 {

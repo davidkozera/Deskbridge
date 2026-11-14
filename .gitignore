@@ -1,3 +1,5 @@
 dist/
 *.zip
 *.exe
+*.syso
+cmd/deskbridge-setup/payload/*.gz

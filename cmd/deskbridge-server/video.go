@@ -146,7 +146,7 @@ func (m *motionVideo) ready(key encoderKey) bool {
 		default:
 			m.enc, m.key, m.started, m.newStream = r.enc, r.key, time.Now(), true
 			log.Printf("video: ready: %v, %d fps, %.1f Mbit/s", r.enc, key.fps, float64(key.bitrate)/1e6)
-			m.s.c.Send(proto.MsgNotice, false, []byte(fmt.Sprintf("Motion is being sent as %s video, encoded by: %v.", mf.CodecName(key.codec), r.enc)))
+			m.s.c.Send(proto.MsgNotice, false, append([]byte{proto.NoticeVideo}, fmt.Sprintf("Motion is being sent as %s video, encoded by: %v.", mf.CodecName(key.codec), r.enc)...))
 		}
 	default:
 	}

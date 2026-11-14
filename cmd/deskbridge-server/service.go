@@ -81,7 +81,17 @@ func installDir() string {
 	return filepath.Join(pf, "Deskbridge")
 }
 
+// quiet is set when the setup program runs "install quiet" or "uninstall
+// quiet": no prompts, no waiting for Enter, and the result as an exit code.
+var (
+	quiet     bool
+	installOK bool
+)
+
 func pause() {
+	if quiet {
+		return
+	}
 	fmt.Println()
 	fmt.Println("Press Enter to close this window.")
 	bufio.NewReader(os.Stdin).ReadString('\n')
@@ -94,7 +104,7 @@ func openSCM(command string) (uintptr, bool) {
 	if scm != 0 {
 		return scm, true
 	}
-	if err == syscall.ERROR_ACCESS_DENIED && !(len(os.Args) > 2 && os.Args[2] == "elevated") {
+	if err == syscall.ERROR_ACCESS_DENIED && !quiet && !(len(os.Args) > 2 && os.Args[2] == "elevated") {
 		exe, _ := os.Executable()
 		r, _, _ := pShellExecute.Call(0, uintptr(unsafe.Pointer(u16("runas"))), uintptr(unsafe.Pointer(u16(exe))),
 			uintptr(unsafe.Pointer(u16(command+" elevated"))), 0, 1)
@@ -221,6 +231,7 @@ func install() {
 	fmt.Println("  Port:      ", proto.DefaultPort)
 	fmt.Println("  Password:  ", password)
 	fmt.Println()
+	installOK = true
 	fmt.Println("Installed in:", dir)
 	fmt.Println("If something misbehaves, see deskbridge.log in that folder.")
 }
@@ -239,6 +250,7 @@ func uninstall() {
 		time.Sleep(time.Second)
 		os.RemoveAll(dir)
 	}
+	installOK = true
 	fmt.Println("The Deskbridge service has been removed.")
 }
 

@@ -1,0 +1,63 @@
+# Builds Deskbridge and publishes it as a GitHub release whenever the VERSION
+# file changes on main. Installed copies find the release, check its
+# signature, and offer it through the client's Update button.
+#
+# Needs one repository secret, UPDATE_SIGNING_KEY: the private half of the
+# key whose public half is in internal/update/key.go.
+# (Settings > Secrets and variables > Actions > New repository secret.)
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [VERSION]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Read version
+        id: version
+        run: echo "version=$(tr -d ' \r\n' < VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Stop if this version is already published
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "::error::Version ${{ steps.version.outputs.version }} is already published. Change the VERSION file to publish a new one."
+            exit 1
+          fi
+
+      - name: Test
+        run: go test ./internal/...
+
+      - name: Build
+        run: ./build.sh
+
+      - name: Sign
+        env:
+          DESKBRIDGE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: go run ./tools/sign -version "${{ steps.version.outputs.version }}" "dist/Deskbridge-Setup-${{ steps.version.outputs.version }}.exe"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${{ steps.version.outputs.version }}"
+          gh release create "v$V" \
+            "dist/Deskbridge-Setup-$V.exe" \
+            "dist/Deskbridge-Setup-$V.exe.sig" \
+            --target "$GITHUB_SHA" \
+            --title "Deskbridge $V" \
+            --notes "Run Deskbridge-Setup-$V.exe on each PC, or click Update in the Deskbridge client. The .sig file is the signature installed copies check before updating."
