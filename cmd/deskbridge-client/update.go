@@ -98,6 +98,7 @@ func updatePlan() (target string, client, server bool) {
 
 // refreshUpdate shows or hides the Update button.
 func refreshUpdate() {
+	refreshVersionLine() // the server's version may have just arrived or gone
 	target, client, server := updatePlan()
 	updateOffered = client || server
 	switch {

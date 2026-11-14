@@ -32,8 +32,9 @@ setup again and click Uninstall.
 To change the password, edit deskbridge-password.txt in
 C:\Program Files\Deskbridge as an administrator, then restart the PC.
 
-The version number is shown in setup's title, in the client's pane
-before connecting, and in each program's Properties > Details.
+The version number is shown in setup's title and in each program's
+Properties > Details. The bottom of the client's left pane shows the
+client's version and the version of the server it is connected to.
 
 UPDATING
   New versions are published at

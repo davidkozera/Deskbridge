@@ -253,6 +253,8 @@ var (
 	hHost, hPort, hPass, hRemember, hConnect uintptr
 	hFPS, hQuality, hAudio, hSleep, hClip    uintptr
 	hVideo, hFast                            uintptr
+	hVersion                                 uintptr
+	statusTop                                int // where the status text starts, at 96 dpi
 	hFullscreen, hStatus, hToggle            uintptr
 	paneCtls                                 []uintptr
 
@@ -534,7 +536,12 @@ func buildPane() {
 	paneCtls = paneCtls[:len(paneCtls)-1]
 	pShowWindow.Call(hUpdate, 0)
 	y += 44
-	hStatus = control("STATIC", "Deskbridge "+proto.Version+"\r\n\r\nNot connected.", 0, 0, m, y, w, 200, 0)
+	statusTop = y
+	hStatus = control("STATIC", "Not connected.", 0, 0, m, y, w, 200, 0)
+	// Pinned to the bottom of the pane by layout(): this client's version
+	// and the connected server's.
+	hVersion = control("STATIC", "", 0, 0, m, y+204, w, versionLineH, 0)
+	refreshVersionLine()
 
 	// The collapse strip is not part of the pane: it stays visible.
 	hToggle, _, _ = pCreateWindowEx.Call(0, uintptr(unsafe.Pointer(u16ptr("BUTTON"))), uintptr(unsafe.Pointer(u16ptr("<"))),
@@ -596,6 +603,27 @@ func layout() {
 		x += sc(toggleWidth)
 	}
 	pMoveWindow.Call(hView, uintptr(x), 0, uintptr(max(cw-x, 0)), uintptr(ch), 1)
+
+	// The version line sits at the bottom of the pane; the status text
+	// takes whatever height is left above it.
+	const m, w = 14, paneWidth - 28
+	versionY := max(ch-sc(versionLineH+10), sc(statusTop+24))
+	pMoveWindow.Call(hVersion, uintptr(sc(m)), uintptr(versionY), uintptr(sc(w)), uintptr(sc(versionLineH)), 1)
+	pMoveWindow.Call(hStatus, uintptr(sc(m)), uintptr(sc(statusTop)), uintptr(sc(w)), uintptr(max(versionY-sc(statusTop)-sc(8), sc(16))), 1)
+}
+
+const versionLineH = 18
+
+// refreshVersionLine fills in the line at the bottom of the pane.
+func refreshVersionLine() {
+	server := "not connected"
+	if cur.Load() != nil {
+		server = "version not reported" // servers older than 1.1.0 do not say
+		if v := serverVersion.Load(); v != nil {
+			server = *v
+		}
+	}
+	setText(hVersion, "Client "+proto.Version+"   |   Server "+server)
 }
 
 func setStatus(s string) { setText(hStatus, s) }
@@ -801,6 +829,7 @@ func onConnectDone() {
 	go receiver(l)
 	applySettings()
 	setText(hConnect, "Disconnect")
+	refreshVersionLine()
 	pEnableWindow.Call(hFullscreen, 1)
 	setStatus("Connected to " + l.host + ".\r\n\r\nClick the remote screen to type on the remote PC. Click in this pane to get your own keyboard back." + videoNote())
 	pSetFocus.Call(hView)
