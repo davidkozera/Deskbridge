@@ -5,6 +5,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
@@ -34,6 +35,10 @@ var (
 
 	pSetDpiCtx        = user32.NewProc("SetProcessDpiAwarenessContext")
 	pGetSystemMetrics = user32.NewProc("GetSystemMetrics")
+	pEnumMonitors     = user32.NewProc("EnumDisplayMonitors")
+	pGetMonitorInfo   = user32.NewProc("GetMonitorInfoW")
+	pLockWorkStation  = user32.NewProc("LockWorkStation")
+	pExitWindowsEx    = user32.NewProc("ExitWindowsEx")
 	pGetDC            = user32.NewProc("GetDC")
 	pReleaseDC        = user32.NewProc("ReleaseDC")
 	pSendInput        = user32.NewProc("SendInput")
@@ -86,6 +91,7 @@ type session struct {
 	codecs      atomic.Uint32 // which video codecs the client can decode
 	restart     atomic.Bool   // the client asked for a fresh video stream
 	fastCapture atomic.Bool
+	monitor     atomic.Int32   // which display to show; -1 for all of them
 	update      updateReceiver // used only by the input goroutine
 	done        chan struct{}
 	once        sync.Once
@@ -443,23 +449,33 @@ type keybdInput struct {
 }
 
 const (
-	mouseMove     = 0x0001
-	mouseAbsolute = 0x8000
+	mouseMove        = 0x0001
+	mouseAbsolute    = 0x8000
+	mouseVirtualDesk = 0x4000 // positions span every display, not just the main one
 )
 
-var screenW, screenH atomic.Int32
+// The part of the desktop being shown (one display, or all of them), in
+// desktop coordinates. Mouse positions from the client are relative to it.
+var regionX, regionY, regionW, regionH atomic.Int32
 
 func sendMouse(x, y int, flags, data uint32) {
-	w, h := int(screenW.Load()), int(screenH.Load())
-	if w < 2 || h < 2 {
+	rw, rh := int(regionW.Load()), int(regionH.Load())
+	// The whole desktop, across every display: positions are given as
+	// fractions of it. Its corner is negative when a display sits left of or
+	// above the main one.
+	metric := func(i uintptr) int { v, _, _ := pGetSystemMetrics.Call(i); return int(int32(v)) }
+	vx, vy, vw, vh := metric(76), metric(77), metric(78), metric(79)
+	if rw < 1 || rh < 1 || vw < 2 || vh < 2 {
 		return
 	}
+	px := int(regionX.Load()) + min(max(x, 0), rw-1)
+	py := int(regionY.Load()) + min(max(y, 0), rh-1)
 	in := mouseInput{
 		typ:       0,
-		dx:        int32(x * 65535 / (w - 1)),
-		dy:        int32(y * 65535 / (h - 1)),
+		dx:        int32((px - vx) * 65535 / (vw - 1)),
+		dy:        int32((py - vy) * 65535 / (vh - 1)),
 		mouseData: data,
-		flags:     flags | mouseMove | mouseAbsolute,
+		flags:     flags | mouseMove | mouseAbsolute | mouseVirtualDesk,
 	}
 	pSendInput.Call(1, uintptr(unsafe.Pointer(&in)), unsafe.Sizeof(in))
 }
@@ -513,6 +529,14 @@ func inputLoop(s *session, peer clipPeer) {
 				if workerMode {
 					clipRelayState(clipEnabled())
 				}
+			}
+		case proto.MsgSelectMonitor:
+			if len(p) >= 1 {
+				s.monitor.Store(int32(int8(p[0])))
+			}
+		case proto.MsgAction:
+			if len(p) >= 1 {
+				doAction(s, p[0])
 			}
 		case proto.MsgUpdateBegin, proto.MsgUpdateData, proto.MsgUpdateEnd:
 			s.update.handle(s, t, p)
@@ -587,125 +611,6 @@ type bitmapInfoHeader struct {
 	ClrImportant  uint32
 }
 
-type capturer struct {
-	w, h                         int
-	screenDC, memDC, bmp, oldBmp uintptr
-	pix                          []byte
-
-	// Fast capture (see dda.go). The standard method above stays set up as
-	// the fallback and shares the same pixel buffer.
-	dup      *dda
-	live     bool          // pix holds a picture from dup, so "nothing changed" can be trusted
-	fast     bool          // the last picture came from fast capture
-	dupRetry time.Time     // when to next try creating dup after a failure
-	dupDelay time.Duration // doubles with each failure in a row
-	dupNote  string        // last thing logged, to avoid repeats
-}
-
-func (c *capturer) dropDup() {
-	if c.dup != nil {
-		c.dup.close()
-		c.dup, c.live = nil, false
-	}
-}
-
-func (c *capturer) free() {
-	c.dropDup()
-	keep := capturer{dupRetry: c.dupRetry, dupDelay: c.dupDelay, dupNote: c.dupNote, fast: c.fast}
-	defer func() { *c = keep }()
-	if c.memDC != 0 {
-		pSelectObject.Call(c.memDC, c.oldBmp)
-		pDeleteObject.Call(c.bmp)
-		pDeleteDC.Call(c.memDC)
-		pReleaseDC.Call(0, c.screenDC)
-	}
-}
-
-// ensure (re)creates the capture surface when the resolution changes.
-func (c *capturer) ensure() (changed bool, ok bool) {
-	w, _, _ := pGetSystemMetrics.Call(0)
-	h, _, _ := pGetSystemMetrics.Call(1)
-	if int(w) == c.w && int(h) == c.h && c.memDC != 0 {
-		return false, true
-	}
-	c.free()
-	if w == 0 || h == 0 || w > 65535 || h > 65535 {
-		return false, false
-	}
-	screenDC, _, _ := pGetDC.Call(0)
-	if screenDC == 0 {
-		return false, false
-	}
-	memDC, _, _ := pCreateCompatibleDC.Call(screenDC)
-	bi := bitmapInfoHeader{Size: 40, Width: int32(w), Height: -int32(h), Planes: 1, BitCount: 32}
-	var bits unsafe.Pointer
-	bmp, _, _ := pCreateDIBSection.Call(memDC, uintptr(unsafe.Pointer(&bi)), 0, uintptr(unsafe.Pointer(&bits)), 0, 0)
-	if memDC == 0 || bmp == 0 || bits == nil {
-		if bmp != 0 {
-			pDeleteObject.Call(bmp)
-		}
-		if memDC != 0 {
-			pDeleteDC.Call(memDC)
-		}
-		pReleaseDC.Call(0, screenDC)
-		return false, false
-	}
-	old, _, _ := pSelectObject.Call(memDC, bmp)
-	*c = capturer{w: int(w), h: int(h), screenDC: screenDC, memDC: memDC, bmp: bmp, oldBmp: old,
-		pix: unsafe.Slice((*byte)(bits), int(w)*int(h)*4)}
-	return true, true
-}
-
-// grab captures the screen into c.pix. With fast it uses Desktop Duplication
-// when that works, waiting up to waitMs for the screen to change; same then
-// reports that it has not, and c.pix is as it was. Otherwise, and whenever
-// fast capture is unavailable, it copies the screen the standard way.
-func (c *capturer) grab(fast bool, waitMs int) (same, ok bool) {
-	now := time.Now()
-	if !fast {
-		c.dropDup()
-	} else if c.dup == nil && now.After(c.dupRetry) {
-		d, err := newDDA()
-		if err != nil {
-			c.dupDelay = min(max(c.dupDelay*2, time.Second), time.Minute)
-			c.dupRetry = now.Add(c.dupDelay)
-			if note := err.Error(); note != c.dupNote {
-				c.dupNote = note
-				log.Printf("capture: fast capture unavailable, using the standard method: %v", err)
-			}
-		} else {
-			c.dup = d
-			if c.dupNote != "fast" {
-				c.dupNote = "fast"
-				log.Print("capture: using fast capture (Desktop Duplication)")
-			}
-		}
-	}
-	if c.dup != nil {
-		switch c.dup.grab(c.pix, c.w, c.h, waitMs) {
-		case ddaFrame:
-			c.live, c.fast, c.dupDelay = true, true, 0
-			return false, true
-		case ddaSame:
-			if c.live {
-				return true, true
-			}
-			// No first picture from it yet: use the standard method meanwhile.
-		default:
-			// Lost: normal when the desktop or display mode changes. Make a
-			// new one shortly, backing off if it keeps happening.
-			c.dropDup()
-			c.dupDelay = min(max(c.dupDelay*2, 250*time.Millisecond), time.Minute)
-			c.dupRetry = now.Add(c.dupDelay)
-		}
-	}
-	// SRCCOPY | CAPTUREBLT
-	r, _, _ := pBitBlt.Call(c.memDC, 0, 0, uintptr(c.w), uintptr(c.h), c.screenDC, 0, 0, 0x00CC0020|0x40000000)
-	pGdiFlush.Call()
-	c.live, c.fast = false, false
-	return false, r != 0
-}
-
 type cursorInfo struct {
 	size   uint32
 	flags  uint32
@@ -734,8 +639,9 @@ func videoLoop(s *session) {
 	var prev []byte
 	vid := newMotionVideo(s)
 	defer vid.close()
-	recheck := false  // compare with the last frame even if the screen has not changed
-	toldFast := false // which capture method the client was last told about
+	recheck := false        // compare with the last frame even if the screen has not changed
+	toldFast := false       // which capture method the client was last told about
+	var toldMonitors []byte // the display list the client was last sent
 	s.c.Send(proto.MsgNotice, false, append([]byte{proto.NoticeVersion}, proto.Version...))
 	s.c.Send(proto.MsgNotice, false, append([]byte{proto.NoticeCapture}, "Screen capture: standard."...))
 	sem := make(chan struct{}, runtime.NumCPU())
@@ -750,7 +656,18 @@ func videoLoop(s *session) {
 		interval := time.Second / time.Duration(min(max(s.fps.Load(), 1), 60))
 		quality := int(min(max(s.quality.Load(), 1), 100))
 		desk.sync(c.free) // freeing forces a fresh capture surface and a full frame
-		changed, ok := c.ensure()
+		choice := int(s.monitor.Load())
+		if desk.name != "" && !strings.EqualFold(desk.name, "Default") {
+			// The lock screen or an admin prompt is showing. Those can be on
+			// a display other than the one being watched, and cannot be
+			// answered unseen, so show every display until it is gone.
+			choice = -1
+		}
+		changed, ok := c.ensure(choice)
+		if sig := c.describe(); ok && !bytes.Equal(sig, toldMonitors) {
+			toldMonitors = sig
+			s.c.Send(proto.MsgMonitors, false, sig)
+		}
 		same := false
 		if ok {
 			same, ok = c.grab(s.fastCapture.Load(), int(min(interval, 40*time.Millisecond)/time.Millisecond))
@@ -771,8 +688,10 @@ func videoLoop(s *session) {
 		}
 		if changed {
 			prev = nil
-			screenW.Store(int32(c.w))
-			screenH.Store(int32(c.h))
+			regionX.Store(int32(c.x))
+			regionY.Store(int32(c.y))
+			regionW.Store(int32(c.w))
+			regionH.Store(int32(c.h))
 			sz := binary.LittleEndian.AppendUint32(nil, uint32(c.w))
 			sz = binary.LittleEndian.AppendUint32(sz, uint32(c.h))
 			if s.c.Send(proto.MsgSize, false, sz) != nil {

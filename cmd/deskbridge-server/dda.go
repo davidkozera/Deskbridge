@@ -125,12 +125,13 @@ type dda struct {
 	dupl, staging      uintptr
 	stagingW, stagingH uint32
 	primed             bool
+	left, top          int32 // which monitor
 }
 
-// newDDA starts duplicating the primary monitor of whichever desktop is
-// showing right now.
-func newDDA() (*dda, error) {
-	d := &dda{jobs: make(chan func())}
+// newDDA starts duplicating the monitor whose top-left corner is at
+// (left, top) on whichever desktop is showing right now.
+func newDDA(left, top int) (*dda, error) {
+	d := &dda{jobs: make(chan func()), left: int32(left), top: int32(top)}
 	ready := make(chan error, 1)
 	go func() {
 		runtime.LockOSThread() // never unlocked: the thread ends with this goroutine
@@ -168,8 +169,8 @@ func (d *dda) init() error {
 	}
 	defer release(factory)
 
-	// Find the primary monitor (the one whose top-left corner is 0,0) and
-	// the graphics adapter driving it.
+	// Find the monitor (by where its top-left corner sits on the desktop)
+	// and the graphics adapter driving it.
 	var adapter, output uintptr
 	for a := uintptr(0); a < 16 && output == 0; a++ {
 		var ad uintptr
@@ -182,7 +183,7 @@ func (d *dda) init() error {
 				break
 			}
 			var desc outputDesc
-			if hok(hcall(out, outputGetDesc, uintptr(unsafe.Pointer(&desc)))) && desc.attached != 0 && desc.left == 0 && desc.top == 0 {
+			if hok(hcall(out, outputGetDesc, uintptr(unsafe.Pointer(&desc)))) && desc.attached != 0 && desc.left == d.left && desc.top == d.top {
 				if desc.rotation > 1 { // 0 = unspecified, 1 = not rotated
 					release(out)
 					release(ad)
@@ -198,7 +199,7 @@ func (d *dda) init() error {
 		}
 	}
 	if output == 0 {
-		return errors.New("primary monitor not found")
+		return errors.New("that monitor was not found")
 	}
 	defer release(adapter)
 	defer release(output)
@@ -234,16 +235,17 @@ func (d *dda) release() {
 	}
 }
 
-// grab waits up to waitMs for the screen to change and, if it did, copies
-// the new picture into pix (w×h, BGRA, top row first).
-func (d *dda) grab(pix []byte, w, h, waitMs int) (result int) {
+// grab waits up to waitMs for the monitor to change and, if it did, copies
+// its new w×h picture into pix at (offX, offY). pix is BGRA, top row first,
+// with rows stride pixels long; it may be larger than one monitor.
+func (d *dda) grab(pix []byte, stride, offX, offY, w, h, waitMs int) (result int) {
 	done := make(chan struct{})
-	d.jobs <- func() { result = d.grabOnThread(pix, w, h, waitMs); close(done) }
+	d.jobs <- func() { result = d.grabOnThread(pix, stride, offX, offY, w, h, waitMs); close(done) }
 	<-done
 	return
 }
 
-func (d *dda) grabOnThread(pix []byte, w, h, waitMs int) int {
+func (d *dda) grabOnThread(pix []byte, stride, offX, offY, w, h, waitMs int) int {
 	var info frameInfo
 	var resource uintptr
 	hr := hcall(d.dupl, duplAcquireNextFrame, uintptr(waitMs), uintptr(unsafe.Pointer(&info)), uintptr(unsafe.Pointer(&resource)))
@@ -289,16 +291,17 @@ func (d *dda) grabOnThread(pix []byte, w, h, waitMs int) int {
 		return ddaLost
 	}
 	pitch, row := int(m.rowPitch), w*4
-	if pitch < row || len(pix) < row*h {
+	if pitch < row || offX < 0 || offY < 0 || offX+w > stride || len(pix) < ((offY+h-1)*stride+offX+w)*4 {
 		hcall(d.context, contextUnmap, d.staging, 0)
 		return ddaLost
 	}
 	src := unsafe.Slice((*byte)(m.data), pitch*(h-1)+row)
-	if pitch == row {
-		copy(pix, src)
+	if pitch == row && stride == w && offX == 0 {
+		copy(pix[offY*row:], src)
 	} else {
 		for y := 0; y < h; y++ {
-			copy(pix[y*row:(y+1)*row], src[y*pitch:y*pitch+row])
+			o := ((offY+y)*stride + offX) * 4
+			copy(pix[o:o+row], src[y*pitch:y*pitch+row])
 		}
 	}
 	hcall(d.context, contextUnmap, d.staging, 0)

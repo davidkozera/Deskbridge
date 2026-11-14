@@ -281,6 +281,7 @@ var (
 	pressed      = map[uint32]kbdllHook{} // keys held on the remote PC
 	localDown    = map[uint32]bool{}      // keys whose press was left to this PC
 	swallowEnter bool
+	swallowEnd   bool
 	fullscreen   bool
 	collapsed    bool
 	savedStyle   uintptr
@@ -518,6 +519,10 @@ func buildPane() {
 	hConnect = control("BUTTON", "Connect", bsDefPush|wsTabStop, 0, m, y, w, 32, idConnect)
 	y += 50
 
+	label("Remote display")
+	hMonitor = control("COMBOBOX", "", cbsDropDownList|wsVScroll|wsTabStop, 0, m, y, w, 240, idMonitor)
+	pEnableWindow.Call(hMonitor, 0)
+	y += 36
 	label("Frames per second")
 	hFPS = combo(idFPS, fpsChoices, "")
 	label("Picture quality (photos and video)")
@@ -529,6 +534,9 @@ func buildPane() {
 	hFast = check(idFast, "Fast screen capture")
 	y += 8
 	hFullscreen = control("BUTTON", "Full screen  (Ctrl+Alt+Enter)", wsTabStop, 0, m, y, w, 30, idFullscreen)
+	y += 36
+	hSend = control("BUTTON", "Send to remote PC  \u25BE", wsTabStop, 0, m, y, w, 30, idSend)
+	pEnableWindow.Call(hSend, 0)
 	y += 40
 	// Shown only when a newer version is available (see update.go), so it
 	// is kept out of the list of controls that follow the pane.
@@ -709,6 +717,7 @@ func saveSettings() {
 		"clipboard=" + b(checked(hClip)),
 		"video=" + b(checked(hVideo)),
 		"fastcapture=" + b(checked(hFast)),
+		"display=" + strconv.Itoa(wantedDisplay),
 		"remember=" + b(checked(hRemember)),
 	}
 	if checked(hRemember) {
@@ -752,6 +761,10 @@ func loadSettings() {
 			setChecked(hVideo, v == "1")
 		case "fastcapture":
 			setChecked(hFast, v == "1")
+		case "display":
+			if n >= -1 && n < 16 && v != "" {
+				wantedDisplay = n
+			}
 		case "remember":
 			setChecked(hRemember, v == "1")
 		case "password":
@@ -830,6 +843,8 @@ func onConnectDone() {
 	applySettings()
 	setText(hConnect, "Disconnect")
 	refreshVersionLine()
+	displayRequested = false
+	pEnableWindow.Call(hSend, 1)
 	pEnableWindow.Call(hFullscreen, 1)
 	setStatus("Connected to " + l.host + ".\r\n\r\nClick the remote screen to type on the remote PC. Click in this pane to get your own keyboard back." + videoNote())
 	pSetFocus.Call(hView)
@@ -851,6 +866,9 @@ func onDisconnected(id uintptr) {
 	fbMu.Unlock()
 	curCursor.Store(arrow)
 	setText(hConnect, "Connect")
+	pEnableWindow.Call(hSend, 0)
+	remoteDisplays.Store(nil)
+	showDisplays()
 	pEnableWindow.Call(hFullscreen, 0)
 	serverVersion.Store(nil)
 	setTitle("Deskbridge")
@@ -1140,6 +1158,11 @@ func receiver(l *link) {
 			}
 			wg.Add(1)
 			jobs <- job{p[8], p[9:], r}
+		case proto.MsgMonitors:
+			if d := parseDisplays(p); d != nil {
+				remoteDisplays.Store(d)
+				pPostMessage.Call(hMain, wmMonitors, 0, 0)
+			}
 		case proto.MsgUpdateResult:
 			select {
 			case updateResult <- p:
@@ -1156,6 +1179,8 @@ func receiver(l *link) {
 				v := string(p[1:])
 				serverVersion.Store(&v)
 				pPostMessage.Call(hMain, wmUpdateInfo, 0, 0)
+			case proto.NoticeGeneral:
+				postStatus(string(p[1:]))
 			case proto.NoticeCapture:
 				video.capture = string(p[1:])
 				postStatus(video.report())
@@ -1200,6 +1225,10 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 	if updateMessage(message, wParam) {
 		return 0
 	}
+	if message == wmMonitors {
+		showDisplays()
+		return 0
+	}
 	switch message {
 	case wmSize:
 		layout()
@@ -1226,6 +1255,10 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 			}
 		case id == idUpdate && code == 0:
 			startUpdate()
+		case id == idMonitor && code == 1: // CBN_SELCHANGE
+			displayPicked()
+		case id == idSend && code == 0:
+			sendMenu()
 		case id == idToggle && code == 0:
 			collapsed = !collapsed
 			layout()
@@ -1573,7 +1606,7 @@ func keyboardHook(nCode, wParam, lParam uintptr) uintptr {
 		focus, _, _ := pGetFocus.Call()
 		forward = fg == hMain && focus == hView
 	}
-	if _, remote := pressed[id]; up && !remote && !(k.vk == 0x0D && swallowEnter) {
+	if _, remote := pressed[id]; up && !remote && !(k.vk == 0x0D && swallowEnter) && !(k.vk == 0x23 && swallowEnd) {
 		forward = false // a release we never sent the press for
 	}
 	if !forward {
@@ -1586,7 +1619,7 @@ func keyboardHook(nCode, wParam, lParam uintptr) uintptr {
 		return r
 	}
 
-	const vkReturn, vkLCtrl, vkRCtrl, vkLAlt, vkRAlt = 0x0D, 0xA2, 0xA3, 0xA4, 0xA5
+	const vkReturn, vkEnd, vkLCtrl, vkRCtrl, vkLAlt, vkRAlt = 0x0D, 0x23, 0xA2, 0xA3, 0xA4, 0xA5
 	held := func(vks ...uint32) bool {
 		for _, v := range vks {
 			for _, p := range pressed {
@@ -1596,6 +1629,21 @@ func keyboardHook(nCode, wParam, lParam uintptr) uintptr {
 			}
 		}
 		return false
+	}
+	if k.vk == vkEnd {
+		// Ctrl+Alt+End stands in for Ctrl+Alt+Del, which Windows always
+		// keeps for this PC.
+		if !up && held(vkLCtrl, vkRCtrl) && held(vkLAlt, vkRAlt) {
+			if !swallowEnd {
+				swallowEnd = true
+				queue(proto.MsgAction, []byte{proto.ActionCtrlAltDel})
+			}
+			return 1
+		}
+		if up && swallowEnd {
+			swallowEnd = false
+			return 1
+		}
 	}
 	if k.vk == vkReturn {
 		if !up && held(vkLCtrl, vkRCtrl) && held(vkLAlt, vkRAlt) {

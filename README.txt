@@ -74,6 +74,13 @@ USING THE CLIENT
   Computer / Port / Password   Where to connect. Tick "Remember
                                password" to keep it (encrypted for your
                                Windows account) for next time.
+  Remote display               Which of the remote PC's displays to
+                               show, or all of them side by side. The
+                               choice is remembered. The list follows
+                               displays being plugged in or removed.
+                               While the lock screen or an admin prompt
+                               is up, all displays are shown, because
+                               those can appear on any of them.
   Frames per second            Lower it on a slow network.
   Picture quality              Affects photos and video; text is always
                                sent pixel-perfect.
@@ -96,6 +103,13 @@ USING THE CLIENT
                                back by itself if fast capture fails.
   Full screen                  Also Ctrl+Alt+Enter, which is the way
                                back out.
+  Send to remote PC            A menu of things that cannot be typed
+                               across: Ctrl+Alt+Del (also Ctrl+Alt+End
+                               on the keyboard), Lock, Task Manager,
+                               Sign out, Restart and Shut down. The
+                               last three ask first. After Restart the
+                               remote PC comes back by itself; after
+                               Shut down someone has to turn it on.
 
   The options below Connect apply immediately, while connected.
 
@@ -165,11 +179,15 @@ COPY AND PASTE
   - Untick "Share copy and paste" in the client to switch it off.
 
 LIMITS
-  - Ctrl+Alt+Del cannot be sent to the remote PC.
+  - Ctrl+Alt+Del needs the installed service on the remote PC; a server
+    started by hand cannot send it.
   - The PC must be awake. The service stops it idling to sleep, but
     closing the lid or pressing the power button still puts it to sleep
     unless you change that in Windows power settings.
-  - Only the primary monitor is shared.
+  - "All displays" shows the displays as Windows arranges them, with
+    black where none reaches. It is a large picture: expect it to be
+    slower than a single display, and H.264 video may not be available
+    for it.
   - Sound keeps playing on the Arm PC's own speakers too.
   - One client at a time. A new connection replaces the old one.
 
