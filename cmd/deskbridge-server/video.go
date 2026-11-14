@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -107,7 +108,13 @@ func (m *motionVideo) want(w, h int, interval time.Duration, quality int) (encod
 		// Bits per pixel from the client's quality setting: about 0.04 at
 		// 50, 0.15 at 85.
 		bpp := min(max(0.04+float64(quality-50)/45*0.14, 0.03), 0.20)
-		k.bitrate = int(min(max(float64(k.w*k.h*k.fps)*bpp, 2e6), 80e6))
+		// Above 60 frames a second each frame differs less from the last, so
+		// the bit rate grows more slowly than the frame rate.
+		rate := float64(k.fps)
+		if rate > 60 {
+			rate = 60 * math.Sqrt(rate/60)
+		}
+		k.bitrate = int(min(max(float64(k.w*k.h)*rate*bpp, 2e6), 80e6))
 		return k, true
 	}
 	return encoderKey{}, false

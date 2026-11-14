@@ -294,7 +294,7 @@ var (
 )
 
 var (
-	fpsChoices     = []int{10, 15, 20, 30, 45, 60}
+	fpsChoices     = []int{10, 15, 20, 30, 45, 60, 90, 120}
 	qualityChoices = []int{50, 60, 70, 80, 85, 90, 95}
 )
 
@@ -402,6 +402,7 @@ func main() {
 	hView, _, _ = pCreateWindowEx.Call(0, uintptr(unsafe.Pointer(viewClass)), 0, wsChild|wsVisible, 0, 0, 10, 10, hMain, 0, inst, 0)
 	loadSettings()
 	startClipboard()
+	user32.NewProc("SetTimer").Call(hMain, 1, 1000, 0) // drives the frame-rate readout
 	go watchForUpdates()
 	go func() { // finding decoders can take a moment; do not hold up the window
 		var caps uint32
@@ -631,8 +632,20 @@ func refreshVersionLine() {
 			server = *v
 		}
 	}
-	setText(hVersion, "Client "+proto.Version+"   |   Server "+server)
+	line := "Client " + proto.Version + "   |   Server " + server
+	if cur.Load() != nil && measuredFPS >= 0 {
+		// What is actually arriving, which can be well under the setting.
+		line += "   |   " + strconv.Itoa(measuredFPS) + " fps"
+	}
+	setText(hVersion, line)
 }
+
+// framesShown counts frames as they arrive; once a second the UI thread
+// turns the count into the rate shown at the bottom of the pane.
+var (
+	framesShown atomic.Int32
+	measuredFPS = -1 // UI thread only; -1 until the first measurement
+)
 
 func setStatus(s string) { setText(hStatus, s) }
 
@@ -1189,6 +1202,7 @@ func receiver(l *link) {
 			wg.Wait() // anything drawn before this frame must land first
 			video.handle(p)
 		case proto.MsgFrameEnd:
+			framesShown.Add(1)
 			wg.Wait()
 			pPostMessage.Call(hView, wmRepaint, 0, 0)
 			select { // must not be dropped: the server waits for it
@@ -1333,6 +1347,16 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 		return 0
 	case wmDisconnected:
 		onDisconnected(wParam)
+		return 0
+	case 0x0113: // WM_TIMER, once a second
+		n := int(framesShown.Swap(0))
+		if cur.Load() == nil {
+			n = -1
+		}
+		if n != measuredFPS {
+			measuredFPS = n
+			refreshVersionLine()
+		}
 		return 0
 	case wmDestroy:
 		saveSettings()

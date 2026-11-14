@@ -34,7 +34,8 @@ C:\Program Files\Deskbridge as an administrator, then restart the PC.
 
 The version number is shown in setup's title and in each program's
 Properties > Details. The bottom of the client's left pane shows the
-client's version and the version of the server it is connected to.
+client's version, the version of the server it is connected to, and
+how many frames a second are arriving.
 
 UPDATING
   New versions are published at
@@ -81,7 +82,13 @@ USING THE CLIENT
                                While the lock screen or an admin prompt
                                is up, all displays are shown, because
                                those can appear on any of them.
-  Frames per second            Lower it on a slow network.
+  Frames per second            Up to 120. This is a ceiling, not a
+                               promise: the rate actually arriving is
+                               shown at the bottom of the pane. Lower it
+                               on a slow network. Above 60 needs the
+                               remote PC's display set to a refresh rate
+                               that high, and a screen on this PC that
+                               can show it.
   Picture quality              Affects photos and video; text is always
                                sent pixel-perfect.
   Play sound from the remote PC

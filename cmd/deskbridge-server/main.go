@@ -653,7 +653,7 @@ func videoLoop(s *session) {
 			continue
 		}
 		start := time.Now()
-		interval := time.Second / time.Duration(min(max(s.fps.Load(), 1), 60))
+		interval := time.Second / time.Duration(min(max(s.fps.Load(), 1), 120))
 		quality := int(min(max(s.quality.Load(), 1), 100))
 		desk.sync(c.free) // freeing forces a fresh capture surface and a full frame
 		choice := int(s.monitor.Load())
