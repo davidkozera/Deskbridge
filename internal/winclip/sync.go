@@ -122,21 +122,61 @@ func (s *Sync) onThread(f func()) { Post(s.hwnd, taskMessage, f) }
 
 // Connect makes send the destination for local copies.
 func (s *Sync) Connect(send Sender) *Peer {
-	p := &Peer{s: s, send: send}
+	p := s.NewPeer(send)
 	s.cur.Store(p)
 	return p
 }
 
-// Close ends the connection's sharing: transfers in progress fail, and files
-// from the other PC that can no longer be fetched leave the clipboard.
-func (p *Peer) Close() {
+// NewPeer prepares a connection's side of the exchange without sharing
+// with it yet. A program that holds several connections makes one for
+// each and shares the clipboard with one at a time: see Activate.
+func (s *Sync) NewPeer(send Sender) *Peer { return &Peer{s: s, send: send} }
+
+// Activate makes this connection the one the clipboard is shared with, in
+// place of any other. With announce, what is on this PC's clipboard right
+// now is sent to it as if it had just been copied, so that something
+// copied while another connection was in front can be pasted on this one.
+// Safe to call from any goroutine.
+func (p *Peer) Activate(announce bool) {
 	s := p.s
-	s.cur.CompareAndSwap(p, nil)
+	if old := s.cur.Swap(p); old == p {
+		return
+	} else if old != nil {
+		old.retire()
+	}
+	if announce {
+		s.mu.Lock()
+		s.remotePrint = nil // it did not come from this PC's new partner
+		s.mu.Unlock()
+		s.onThread(func() { s.announce(true) })
+	}
+}
+
+// Deactivate stops sharing with this connection, if it is the one being
+// shared with: transfers in progress fail, and files from the other PC
+// that can no longer be fetched leave the clipboard. Safe to call from any
+// goroutine.
+func (p *Peer) Deactivate() {
+	if p.s.cur.CompareAndSwap(p, nil) {
+		p.retire()
+	}
+}
+
+// retire cleans up after a peer that has just stopped being the current
+// one.
+func (p *Peer) retire() {
+	s := p.s
 	s.gen.Add(1)
-	p.blob.Abort()
 	s.server.Clear()
 	s.abortStreams()
 	s.onThread(s.withdraw)
+}
+
+// Close ends the connection's sharing. Call it from the goroutine that
+// calls Remote, once the connection is over.
+func (p *Peer) Close() {
+	p.blob.Abort()
+	p.Deactivate()
 }
 
 // Shutdown takes our virtual files off the clipboard before the program
@@ -223,17 +263,23 @@ func (s *Sync) streamGone(st *streamObject) {
 
 // localChanged reacts to something being copied on this PC. Clipboard
 // thread only.
-func (s *Sync) localChanged() {
+func (s *Sync) localChanged() { s.announce(false) }
+
+// announce tells the other PC what is on this PC's clipboard. Normally
+// that is skipped when the content is what the other PC itself put here;
+// with force it is sent regardless, for a partner that has just changed.
+// Clipboard thread only.
+func (s *Sync) announce(force bool) {
 	p := s.cur.Load()
 	if p == nil || !s.Enabled() {
 		return
 	}
-	if seq := s.setSeq.Load(); seq != 0 && seq == Sequence() {
+	if seq := s.setSeq.Load(); !force && seq != 0 && seq == Sequence() {
 		return // this is our own write being reported back
 	}
 	formats, files := ReadAll(s.hwnd)
 	s.mu.Lock()
-	echo := len(files) == 0 && s.remotePrint.Matches(formats)
+	echo := !force && len(files) == 0 && s.remotePrint.Matches(formats)
 	if !echo {
 		s.remotePrint = nil // this PC's clipboard is its own again
 	}
@@ -281,8 +327,8 @@ func (s *Sync) localChanged() {
 // goroutine that reads the connection; it never waits on the network.
 func (p *Peer) Remote(t byte, payload []byte) {
 	s := p.s
-	if !s.Enabled() || s.hwnd == 0 {
-		return
+	if !s.Enabled() || s.hwnd == 0 || s.cur.Load() != p {
+		return // sharing is off, or is with another connection just now
 	}
 	switch t {
 	case proto.MsgClipBlobBegin, proto.MsgClipBlobData, proto.MsgClipBlobEnd:

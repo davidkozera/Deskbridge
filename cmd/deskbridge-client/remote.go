@@ -9,7 +9,6 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
-	"sync/atomic"
 	"unsafe"
 
 	"deskbridge/internal/proto"
@@ -31,13 +30,12 @@ var (
 	pDestroyMenu     = user32.NewProc("DestroyMenu")
 	pMessageBoxW     = user32.NewProc("MessageBoxW")
 
-	remoteDisplays atomic.Pointer[displayList] // the latest list from the server
-
 	// Touched only on the UI thread.
-	hMonitor, hSend  uintptr
-	displays         displayList // what the picker currently shows
-	wantedDisplay    = noPreference
-	displayRequested bool // the saved choice has been asked for on this connection
+	hMonitor, hSend uintptr
+	displays        displayList // what the picker currently shows
+	// wantedDisplay is the display the connection being set up should
+	// show, while no tab is open. Each tab has its own.
+	wantedDisplay = noPreference
 )
 
 type display struct {
@@ -66,11 +64,15 @@ func parseDisplays(p []byte) *displayList {
 	return d
 }
 
-// showDisplays fills the picker from the server's list. The last entry,
-// when there is more than one display, shows them all side by side.
+// showDisplays fills the picker from the list sent by the server of the
+// tab in front. The last entry, when there is more than one display, shows
+// them all side by side.
 func showDisplays() {
-	d := remoteDisplays.Load()
-	if d == nil || cur.Load() == nil {
+	var d *displayList
+	if l := cur.Load(); l != nil {
+		d = l.displays.Load()
+	}
+	if d == nil {
 		displays = displayList{}
 		pSendMessage.Call(hMonitor, 0x014B, 0, 0) // CB_RESETCONTENT
 		pEnableWindow.Call(hMonitor, 0)
@@ -100,15 +102,23 @@ func showDisplays() {
 	}
 	pSendMessage.Call(hMonitor, 0x014E, uintptr(index), 0) // CB_SETCURSEL
 	pEnableWindow.Call(hMonitor, 1)
+}
 
-	// Go back to the display chosen last time, once per connection, if the
-	// remote PC still has it.
-	if !displayRequested && wantedDisplay != noPreference {
-		displayRequested = true
-		valid := wantedDisplay < len(d.list) && (wantedDisplay >= 0 || len(d.list) > 1)
-		if valid && wantedDisplay != d.selected {
-			queue(proto.MsgSelectMonitor, []byte{byte(int8(wantedDisplay))})
-		}
+// requestDisplay has a tab's connection go back to the display chosen for
+// it last time, once per connection, if the remote PC still has it. It
+// applies to tabs behind the one in front too.
+func requestDisplay(tb *tab) {
+	if tb.l == nil || tb.displayRequested || tb.wantedDisplay == noPreference {
+		return
+	}
+	d := tb.l.displays.Load()
+	if d == nil {
+		return
+	}
+	tb.displayRequested = true
+	valid := tb.wantedDisplay < len(d.list) && (tb.wantedDisplay >= 0 || len(d.list) > 1)
+	if valid && tb.wantedDisplay != d.selected {
+		sendTo(tb.l, proto.MsgSelectMonitor, []byte{byte(int8(tb.wantedDisplay))})
 	}
 }
 
@@ -122,12 +132,16 @@ func displayPicked() {
 	if index == len(displays.list) {
 		index = -1 // all
 	}
-	wantedDisplay, displayRequested = index, true
+	tb := active
+	if tb == nil || tb.l == nil {
+		return
+	}
+	tb.wantedDisplay, tb.displayRequested = index, true
 	if p := currentProfile(); p >= 0 {
 		computers[p].display = index
 	}
 	// The connection's resolution goes with it to the display now chosen.
-	resRequested = false
+	tb.resRequested = false
 	queue(proto.MsgSelectMonitor, []byte{byte(int8(index))})
 	saveSettings()
 	pSetFocus.Call(hView)

@@ -84,16 +84,44 @@ USING THE CLIENT
 
   The pane starts hidden. If a computer name and remembered password are
   saved, the client connects by itself on launch. The pane opens on its
-  own when details are missing, a connection fails, or you disconnect.
+  own when details are missing, a connection fails, or you close the
+  last connection.
+
+  SEVERAL CONNECTIONS AT ONCE
+  Each connection has a tab in the strip above the remote screen,
+  labelled with its connection name. To open another, pick or type it in
+  the pane and click Connect: it gets a tab of its own and the ones
+  already open stay connected (up to 12).
+
+  - Click a tab to switch to it. Ctrl+Alt+PageDown and Ctrl+Alt+PageUp
+    step to the next and previous tab, which also works in full screen,
+    where the strip is hidden.
+  - Click a tab's x, or middle-click the tab, to close that connection.
+    The pane's Disconnect button closes the tab in front.
+  - The tab in front is the one you see and control. It alone gets the
+    keyboard and mouse, plays sound and shares copy and paste. The
+    pane's Remote display and Remote resolution lists, "Send to remote
+    PC" and Full screen are about it, and switching tabs puts its
+    details in the pane's boxes.
+  - The tabs behind stay connected at two frames a second, without
+    sound or video for motion, so they cost little and their pictures
+    are current when you switch to them.
+  - Frames per second, picture quality and the tick boxes apply to all
+    connections.
+  - A tab whose label ends in "(connecting...)" is still connecting or
+    is reconnecting; "(not connected)" means the attempt failed or
+    another PC took that connection over. Click Connect to try again,
+    or close the tab.
+  - A PC serves one client at a time, so it can only be open in one tab.
 
   If a connection is lost (a network blip, the remote PC restarting,
-  this PC waking from sleep), the client reconnects by itself: it tries
+  this PC waking from sleep), its tab reconnects by itself: it tries
   after 1, 2 and 4 seconds and then every 8, for as long as it takes,
   and returns to full screen if that is where you were. The same goes
   for the saved computer at launch if it is not answering yet. To give
-  up, open the pane and click "Stop trying". It does not reconnect after
-  you click Disconnect, if the password is refused, or when another PC
-  connects to the same server and takes over.
+  up, close the tab (or click "Stop trying" in the pane). A tab does not
+  reconnect if the password is refused or when another PC connects to
+  the same server and takes over.
 
   A lost connection is noticed within about eight seconds even when
   nothing is happening on screen, because the two PCs check on each
@@ -259,6 +287,13 @@ COPY AND PASTE
   - On the Arm PC, copy and paste works while someone is signed in (not
     from the sign-in screen).
   - Untick "Share copy and paste" in the client to switch it off.
+  - With several connections open, copy and paste is shared with the
+    tab in front. When you switch tabs, what is on this PC's clipboard
+    goes to the PC you switched to, so text or a picture copied on one
+    remote PC can be pasted on another. Files copied on a remote PC can
+    be pasted on this PC while that tab is in front, but not straight
+    onto another remote PC: paste them here first, then copy them from
+    here.
 
 LIMITS
   - Ctrl+Alt+Del needs the installed service on the remote PC; a server

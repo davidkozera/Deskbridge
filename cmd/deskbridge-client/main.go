@@ -9,7 +9,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -228,22 +227,66 @@ type kbdllHook struct {
 	extra uintptr
 }
 
-// link is one connection to a server.
+// link is one live connection to a server, with everything that belongs
+// to it: the remote screen's picture and what the server has said about
+// itself. Several can be live at once, one for each connected tab.
 type link struct {
 	id    uintptr
 	c     *proto.Conn
-	name  string         // what the connection is called
+	name  string         // what the connection was called when it was made
 	out   chan [2][]byte // {type, payload}: input, may be dropped if stalled
 	bulk  chan [2][]byte // clipboard data: never dropped, yields to input
 	done  chan struct{}
 	once  sync.Once
 	heard atomic.Int64 // when anything last arrived from the server
 	pong  atomic.Bool  // the server answers pings, so silence means the link is dead
+
+	// The remote screen. Decoders writing disjoint areas share the read
+	// lock; the painter and resizes take the write lock.
+	fbMu     sync.RWMutex
+	fb       []byte
+	fbW, fbH int
+	cursor   atomic.Uintptr // the remote pointer's shape
+
+	displays     atomic.Pointer[displayList] // the server's latest list of displays
+	modes        atomic.Pointer[modeList]    // the resolutions the shown display offers
+	version      atomic.Pointer[string]      // the server's version, if it said
+	replaced     atomic.Bool                 // the server said another client took our place
+	status       atomic.Pointer[string]      // text for the pane, waiting to be collected
+	updateResult chan []byte                 // the server's answer to an update
+
+	peer *winclip.Peer // this connection's side of clipboard sharing; nil if unavailable
+}
+
+func newLink(id uintptr, c *proto.Conn, name string) *link {
+	l := &link{id: id, c: c, name: name, out: make(chan [2][]byte, 2048), bulk: make(chan [2][]byte, 2),
+		done: make(chan struct{}), updateResult: make(chan []byte, 1)}
+	l.heard.Store(time.Now().UnixNano())
+	l.cursor.Store(arrow)
+	if clip != nil {
+		// Clipboard data is never dropped, but waits its turn behind input.
+		l.peer = clip.NewPeer(func(t byte, p []byte) error {
+			select {
+			case l.bulk <- [2][]byte{{t}, p}:
+				return nil
+			case <-l.done:
+				return errors.New("disconnected")
+			}
+		})
+	}
+	return l
 }
 
 func (l *link) close() { l.once.Do(func() { close(l.done); l.c.Close() }) }
 
+// postStatus leaves text for the pane about this connection.
+func (l *link) postStatus(s string) {
+	l.status.Store(&s)
+	pPostMessage.Call(hMain, wmStatus, l.id, 0)
+}
+
 type connectResult struct {
+	tab         uintptr // the tab the attempt was for
 	l           *link
 	err         string
 	badPassword bool
@@ -263,35 +306,26 @@ var (
 	hFullscreen, hStatus, hToggle                   uintptr
 	paneCtls                                        []uintptr
 
-	cur        atomic.Pointer[link] // nil when not connected
+	cur        atomic.Pointer[link] // the connection in front; nil when that tab is not connected
 	nextLinkID uintptr
-	connecting bool
-	connectRes atomic.Pointer[connectResult]
 	audioOn    atomic.Bool
 	clipOn     atomic.Bool
 	statusText atomic.Pointer[string]
 	videoCaps  atomic.Uint32 // codecs this PC can decode, once known
 	capsKnown  atomic.Bool
 
-	// Framebuffer. Decoders writing disjoint areas share the read lock; the
-	// painter and resizes take the write lock.
-	fbMu     sync.RWMutex
-	fb       []byte
-	fbW, fbH int
-
-	curCursor atomic.Uintptr
-	arrow     uintptr
+	arrow uintptr
 
 	// Touched only on the UI thread.
-	pressed      = map[uint32]kbdllHook{} // keys held on the remote PC
-	localDown    = map[uint32]bool{}      // keys whose press was left to this PC
-	swallowEnter bool
-	swallowEnd   bool
-	fullscreen   bool
-	collapsed    bool
-	savedStyle   uintptr
-	savedRect    rect
-	lastFocus    uintptr
+	pressed    = map[uint32]kbdllHook{} // keys held on the remote PC in front
+	localDown  = map[uint32]bool{}      // keys whose press was left to this PC
+	swallowing = map[uint32]bool{}      // keys of our own shortcuts whose release is still to come
+	keysDown   = map[uint32]bool{}      // keys physically held, wherever their presses went
+	fullscreen bool
+	collapsed  bool
+	savedStyle uintptr
+	savedRect  rect
+	lastFocus  uintptr
 	// localKeys is set while the pointer is on the title bar or border, or
 	// the window is being moved or sized. Keys then stay on this PC, so
 	// window managers that watch for Shift or Win shortcuts still see them.
@@ -376,11 +410,10 @@ func main() {
 
 	inst, _, _ = pGetModuleHandle.Call(0)
 	arrow, _, _ = pLoadCursor.Call(0, 32512)
-	curCursor.Store(arrow)
 	audioOn.Store(true)
 	clipOn.Store(true)
 
-	mainClass, viewClass := u16ptr("DeskbridgeMain"), u16ptr("DeskbridgeView")
+	mainClass, viewClass, tabsClass := u16ptr("DeskbridgeMain"), u16ptr("DeskbridgeView"), u16ptr("DeskbridgeTabs")
 	appIcon, _, _ := pLoadIcon.Call(inst, 1) // the icon stamped into the .exe, if any
 	wc := wndClassEx{wndProc: syscall.NewCallback(mainProc), instance: inst, cursor: arrow, icon: appIcon, iconSm: appIcon,
 		background: 16 /* COLOR_BTNFACE+1 */, className: mainClass}
@@ -389,6 +422,9 @@ func main() {
 	vc := wndClassEx{wndProc: syscall.NewCallback(viewProc), instance: inst, cursor: arrow, className: viewClass}
 	vc.size = uint32(unsafe.Sizeof(vc))
 	pRegisterClassEx.Call(uintptr(unsafe.Pointer(&vc)))
+	tc := wndClassEx{wndProc: syscall.NewCallback(tabsProc), instance: inst, cursor: arrow, className: tabsClass}
+	tc.size = uint32(unsafe.Sizeof(tc))
+	pRegisterClassEx.Call(uintptr(unsafe.Pointer(&tc)))
 
 	const cwUseDefault = 0x80000000
 	const wsExControlParent = 0x00010000
@@ -405,6 +441,7 @@ func main() {
 
 	buildPane()
 	hView, _, _ = pCreateWindowEx.Call(0, uintptr(unsafe.Pointer(viewClass)), 0, wsChild|wsVisible, 0, 0, 10, 10, hMain, 0, inst, 0)
+	hTabs, _, _ = pCreateWindowEx.Call(0, uintptr(unsafe.Pointer(tabsClass)), 0, wsChild, 0, 0, 10, 10, hMain, 0, inst, 0)
 	loadSettings()
 	startClipboard()
 	pSetTimer.Call(hMain, timerFrameRate, 1000, 0) // drives the frame-rate readout
@@ -473,8 +510,10 @@ func main() {
 		pTranslateMessage.Call(uintptr(unsafe.Pointer(&m)))
 		pDispatchMessage.Call(uintptr(unsafe.Pointer(&m)))
 	}
-	if l := cur.Load(); l != nil {
-		l.close()
+	for _, tb := range tabs {
+		if tb.l != nil {
+			tb.l.close()
+		}
 	}
 	if clip != nil {
 		clip.Shutdown() // take any virtual files off the clipboard before exiting
@@ -647,7 +686,17 @@ func layout() {
 		pShowWindow.Call(hToggle, 8)
 		x += sc(toggleWidth)
 	}
-	pMoveWindow.Call(hView, uintptr(x), 0, uintptr(max(cw-x, 0)), uintptr(ch), 1)
+	// The strip of tabs runs along the top of the remote screen whenever a
+	// connection is open, except in full screen.
+	y := 0
+	if len(tabs) > 0 && !fullscreen {
+		y = sc(tabsHeight)
+		pMoveWindow.Call(hTabs, uintptr(x), 0, uintptr(max(cw-x, 0)), uintptr(y), 1)
+		pShowWindow.Call(hTabs, 8)
+	} else {
+		pShowWindow.Call(hTabs, 0)
+	}
+	pMoveWindow.Call(hView, uintptr(x), uintptr(y), uintptr(max(cw-x, 0)), uintptr(max(ch-y, 0)), 1)
 
 	// The version line sits at the bottom of the pane; the status text
 	// takes whatever height is left above it.
@@ -662,9 +711,9 @@ const versionLineH = 18
 // refreshVersionLine fills in the line at the bottom of the pane.
 func refreshVersionLine() {
 	server := "not connected"
-	if cur.Load() != nil {
+	if l := cur.Load(); l != nil {
 		server = "version not reported" // servers older than 1.1.0 do not say
-		if v := serverVersion.Load(); v != nil {
+		if v := l.version.Load(); v != nil {
 			server = *v
 		}
 	}
@@ -685,9 +734,15 @@ var (
 
 func setStatus(s string) { setText(hStatus, s) }
 
-func settingsPayload() []byte {
+// settingsPayload is the pane's choices as sent to a server. A connection
+// that is not in front is asked for much less: a couple of frames a second
+// to keep its picture current, no sound and no video.
+func settingsPayload(front bool) []byte {
 	b := []byte{byte(comboValue(hFPS, fpsChoices)), byte(comboValue(hQuality, qualityChoices)), 0, 0, 0, 0, 0, 0}
-	if checked(hAudio) {
+	if !front {
+		b[0] = backgroundFPS
+	}
+	if checked(hAudio) && front {
 		b[2] = 1
 	}
 	if checked(hSleep) {
@@ -696,7 +751,7 @@ func settingsPayload() []byte {
 	if checked(hClip) {
 		b[4] = 1
 	}
-	if checked(hVideo) {
+	if checked(hVideo) && front {
 		b[5] = 1
 	}
 	b[6] = byte(videoCaps.Load())
@@ -706,11 +761,18 @@ func settingsPayload() []byte {
 	return b
 }
 
-// applySettings pushes the pane's choices to the server and remembers them.
+const backgroundFPS = 2
+
+// applySettings pushes the pane's choices to every connected server and
+// remembers them.
 func applySettings() {
 	audioOn.Store(checked(hAudio))
 	clipOn.Store(checked(hClip))
-	queue(proto.MsgSettings, settingsPayload())
+	for _, tb := range tabs {
+		if tb.l != nil {
+			sendSettings(tb.l)
+		}
+	}
 	saveSettings()
 }
 
@@ -857,105 +919,6 @@ func loadSettings() {
 
 // ---------- connecting ----------
 
-func onConnectDone() {
-	res := connectRes.Swap(nil)
-	if res == nil {
-		return
-	}
-	connecting = false
-	pEnableWindow.Call(hConnect, 1)
-	if res.auto && !reconnecting {
-		// The person stopped reconnecting while this attempt was under way.
-		if res.l != nil {
-			res.l.close()
-		}
-		return
-	}
-	if res.l == nil {
-		switch {
-		case reconnecting && res.badPassword:
-			stopReconnect("Reconnecting stopped: the password was not accepted. It may have been changed on that PC.")
-		case reconnecting:
-			scheduleReconnect()
-		default:
-			setStatus(res.err)
-			openPane() // so the reason is visible
-		}
-		return
-	}
-	l := res.l
-	backToFullscreen := reconnecting && restoreFullscreen
-	reconnecting, attempt, viewNote, restoreFullscreen, userClosed = false, 0, "", false, false
-	replaced.Store(false)
-	lastTarget, haveTarget, everConnected = res.target, true, true
-	if !res.auto {
-		rememberComputer(res.target)
-	}
-	cur.Store(l)
-	go sender(l)
-	go receiver(l)
-	go heartbeat(l)
-	applySettings()
-	setText(hConnect, "Disconnect")
-	refreshVersionLine()
-	displayRequested, resRequested = false, false
-	pEnableWindow.Call(hSend, 1)
-	pEnableWindow.Call(hFullscreen, 1)
-	setStatus("Connected to " + l.name + ".\r\n\r\nClick the remote screen to type on the remote PC. Click in this pane to get your own keyboard back." + videoNote())
-	if backToFullscreen {
-		toggleFullscreen()
-	}
-	pSetFocus.Call(hView)
-}
-
-func onDisconnected(id uintptr) {
-	l := cur.Load()
-	if l == nil || l.id != id {
-		return
-	}
-	cur.Store(nil)
-	l.close()
-	clear(pressed)
-	wasFullscreen := fullscreen
-	if fullscreen {
-		toggleFullscreen()
-	}
-	fbMu.Lock()
-	fb, fbW, fbH = nil, 0, 0
-	fbMu.Unlock()
-	curCursor.Store(arrow)
-	setText(hConnect, "Connect")
-	pEnableWindow.Call(hSend, 0)
-	remoteDisplays.Store(nil)
-	showDisplays()
-	remoteModes.Store(nil)
-	showResolutions()
-	pEnableWindow.Call(hFullscreen, 0)
-	serverVersion.Store(nil)
-	setTitle("Deskbridge")
-	if updateNote != "" && time.Since(updateNoteAt) < 3*time.Minute {
-		// Expected: the remote PC is restarting for its update.
-		setStatus(updateNote + "\r\n\r\nDisconnected. Click Connect in a few seconds.")
-	} else {
-		setStatus("Disconnected.")
-	}
-	refreshUpdate()
-	pInvalidateRect.Call(hView, 0, 0)
-	switch {
-	case lostUnexpectedly():
-		// A network blip, the remote PC restarting, this PC waking from
-		// sleep: keep trying, without getting in the way.
-		reconnecting, attempt, restoreFullscreen = true, 0, wasFullscreen
-		scheduleReconnect()
-	case replaced.Load():
-		setStatus("Disconnected: another PC connected to " + l.name + " and took over.")
-		openPane()
-	default:
-		openPane() // so Connect is within reach
-	}
-	userClosed = false
-}
-
 func openPane() {
 	if collapsed {
 		collapsed = false
@@ -1027,6 +990,7 @@ type videoSink struct {
 	notice    string // what the server said about its encoder
 	capture   string // what the server said about its screen capture
 	decoded   string // how video is being decoded here, once known
+	l         *link  // the connection whose picture this draws into
 	host      string
 	restart   func() // asks the server for a new stream
 	// The changed areas that came with the last few frames. Only those are
@@ -1106,11 +1070,12 @@ func (v *videoSink) handle(p []byte) {
 	shown := false
 	err := v.dec.Decode(frame, func(y, uv []byte, stride int) {
 		shown = true
-		fbMu.RLock()
-		if fb != nil && fbW >= w && fbH >= h {
-			proto.NV12RectsToBGRA(fb, fbW, y, uv, stride, w, h, areas)
+		l := v.l
+		l.fbMu.RLock()
+		if l.fb != nil && l.fbW >= w && l.fbH >= h {
+			proto.NV12RectsToBGRA(l.fb, l.fbW, y, uv, stride, w, h, areas)
 		}
-		fbMu.RUnlock()
+		l.fbMu.RUnlock()
 	})
 	if err != nil {
 		if v.dec.AskedGPU() && v.restart != nil {
@@ -1135,7 +1100,7 @@ func (v *videoSink) handle(p []byte) {
 			where = "on the graphics card"
 		}
 		v.decoded = v.notice + " Decoded here " + where + " by: " + v.dec.Name + "."
-		postStatus(v.report())
+		v.l.postStatus(v.report())
 	}
 }
 
@@ -1169,11 +1134,11 @@ func receiver(l *link) {
 	for i := 0; i < runtime.NumCPU(); i++ {
 		go func() {
 			for j := range jobs {
-				fbMu.RLock()
-				if fb != nil {
-					proto.DecodeRect(j.enc, j.data, j.r, fb, fbW, fbH)
+				l.fbMu.RLock()
+				if l.fb != nil {
+					proto.DecodeRect(j.enc, j.data, j.r, l.fb, l.fbW, l.fbH)
 				}
-				fbMu.RUnlock()
+				l.fbMu.RUnlock()
 				wg.Done()
 			}
 		}()
@@ -1181,24 +1146,15 @@ func receiver(l *link) {
 	defer close(jobs)
 	var audio player
 	defer audio.close()
-	video := videoSink{host: l.name, restart: func() {
+	video := videoSink{l: l, host: l.name, restart: func() {
 		select {
 		case l.bulk <- [2][]byte{{proto.MsgVideoRestart}, nil}:
 		case <-l.done:
 		}
 	}}
 	defer video.close()
-	// Clipboard data is never dropped, but waits its turn behind input.
-	var peer *winclip.Peer
-	if clip != nil {
-		peer = clip.Connect(func(t byte, p []byte) error {
-			select {
-			case l.bulk <- [2][]byte{{t}, p}:
-				return nil
-			case <-l.done:
-				return errors.New("disconnected")
-			}
-		})
+	peer := l.peer
+	if peer != nil {
 		defer peer.Close()
 	}
 
@@ -1218,9 +1174,9 @@ func receiver(l *link) {
 				return
 			}
 			wg.Wait()
-			fbMu.Lock()
-			fb, fbW, fbH = make([]byte, w*h*4), w, h
-			fbMu.Unlock()
+			l.fbMu.Lock()
+			l.fb, l.fbW, l.fbH = make([]byte, w*h*4), w, h
+			l.fbMu.Unlock()
 			pPostMessage.Call(hMain, wmRemoteSize, l.id, 0)
 		case proto.MsgRect:
 			if len(p) < 9 {
@@ -1236,17 +1192,17 @@ func receiver(l *link) {
 			l.pong.Store(true)
 		case proto.MsgMonitors:
 			if d := parseDisplays(p); d != nil {
-				remoteDisplays.Store(d)
-				pPostMessage.Call(hMain, wmMonitors, 0, 0)
+				l.displays.Store(d)
+				pPostMessage.Call(hMain, wmMonitors, l.id, 0)
 			}
 		case proto.MsgModes:
 			if m := parseModes(p); m != nil {
-				remoteModes.Store(m)
-				pPostMessage.Call(hMain, wmModes, 0, 0)
+				l.modes.Store(m)
+				pPostMessage.Call(hMain, wmModes, l.id, 0)
 			}
 		case proto.MsgUpdateResult:
 			select {
-			case updateResult <- p:
+			case l.updateResult <- append([]byte(nil), p...):
 			default:
 			}
 		case proto.MsgNotice:
@@ -1258,23 +1214,25 @@ func receiver(l *link) {
 				video.notice = string(p[1:])
 			case proto.NoticeVersion:
 				v := string(p[1:])
-				serverVersion.Store(&v)
+				l.version.Store(&v)
 				pPostMessage.Call(hMain, wmUpdateInfo, 0, 0)
 			case proto.NoticeReplaced:
-				replaced.Store(true)
+				l.replaced.Store(true)
 			case proto.NoticeGeneral:
-				postStatus(string(p[1:]))
+				l.postStatus(string(p[1:]))
 			case proto.NoticeCapture:
 				video.capture = string(p[1:])
-				postStatus(video.report())
+				l.postStatus(video.report())
 			}
 		case proto.MsgVideo:
 			wg.Wait() // anything drawn before this frame must land first
 			video.handle(p)
 		case proto.MsgFrameEnd:
-			framesShown.Add(1)
 			wg.Wait()
-			pPostMessage.Call(hView, wmRepaint, 0, 0)
+			if cur.Load() == l { // only the connection in front is on show
+				framesShown.Add(1)
+				pPostMessage.Call(hView, wmRepaint, 0, 0)
+			}
 			select { // must not be dropped: the server waits for it
 			case l.out <- [2][]byte{{proto.MsgAck}, nil}:
 			case <-l.done:
@@ -1283,8 +1241,10 @@ func receiver(l *link) {
 		case proto.MsgCursor:
 			if len(p) >= 2 {
 				if h, _, _ := pLoadCursor.Call(0, uintptr(binary.LittleEndian.Uint16(p))); h != 0 {
-					curCursor.Store(h)
-					pPostMessage.Call(hView, wmCursor, 0, 0)
+					l.cursor.Store(h)
+					if cur.Load() == l {
+						pPostMessage.Call(hView, wmCursor, 0, 0)
+					}
 				}
 			}
 		case proto.MsgAudioFmt:
@@ -1292,7 +1252,7 @@ func receiver(l *link) {
 				audio.open(binary.LittleEndian.Uint32(p))
 			}
 		case proto.MsgAudio:
-			if audioOn.Load() {
+			if audioOn.Load() && cur.Load() == l { // one PC's sound at a time
 				audio.play(p)
 			}
 		default:
@@ -1309,16 +1269,29 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 	if updateMessage(message, wParam) {
 		return 0
 	}
-	if message == wmMonitors {
-		showDisplays()
+	switch message {
+	case wmMonitors: // wParam: the connection whose list of displays arrived
+		if tb := tabOfLink(wParam); tb != nil {
+			requestDisplay(tb)
+			if tb == active {
+				showDisplays()
+			}
+		}
 		return 0
-	}
-	if message == wmModes {
-		showResolutions()
+	case wmModes: // wParam: the connection whose resolutions arrived
+		if tb := tabOfLink(wParam); tb != nil {
+			modesArrived(tb)
+		}
 		return 0
-	}
-	if message == wmNewConnection {
+	case wmNewConnection:
 		newConnection()
+		refreshConnectButton()
+		return 0
+	case wmNameChanged:
+		refreshConnectButton()
+		return 0
+	case wmSwitchTab:
+		stepTab(wParam == 1)
 		return 0
 	}
 	switch message {
@@ -1329,28 +1302,19 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 		id, code := int(wParam&0xFFFF), int(wParam>>16&0xFFFF)
 		switch {
 		case id == idConnect && code == 0:
-			if l := cur.Load(); l != nil {
-				// Enter anywhere in the pane also arrives here; only a
-				// deliberate press of the button itself disconnects.
-				if f, _, _ := pGetFocus.Call(); f == hConnect {
-					userClosed = true
-					l.close() // the receiver notices and reports back
-				}
-			} else if reconnecting {
-				if f, _, _ := pGetFocus.Call(); f == hConnect {
-					stopReconnect("Disconnected.")
-				}
-			} else {
-				startConnect()
-			}
+			connectClicked()
 		case id == idName && code == 1: // CBN_SELCHANGE: a saved connection was picked
 			computerPicked()
+			// The list puts the name in the box after telling us; relabel
+			// the Connect button once it has.
+			pPostMessage.Call(hMain, wmNameChanged, 0, 0)
 		case id == idName && code == 5: // CBN_EDITCHANGE: typing
 			forgettable := uintptr(0)
 			if findComputer(cleanName(getText(hName))) >= 0 {
 				forgettable = 1
 			}
 			pEnableWindow.Call(hForget, forgettable)
+			refreshConnectButton()
 		case id == idResolution && code == 1: // CBN_SELCHANGE
 			resolutionPicked()
 		case id == idForget && code == 0:
@@ -1389,6 +1353,7 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 		if wParam&0xFFFF == 0 {
 			lastFocus, _, _ = pGetFocus.Call()
 			releaseKeys()
+			clear(keysDown) // their releases may go unseen while another window is in front
 		}
 	case wmSetFocus:
 		// A plain window does not hand focus back to a child by itself.
@@ -1408,10 +1373,7 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 		return 0
 	case wmRemoteSize:
 		if l := cur.Load(); l != nil && l.id == wParam {
-			fbMu.RLock()
-			title := fmt.Sprintf("Deskbridge - %s (%d x %d)", l.name, fbW, fbH)
-			fbMu.RUnlock()
-			setTitle(title)
+			refreshTitle()
 			pInvalidateRect.Call(hView, 0, 0)
 		}
 		return 0
@@ -1419,8 +1381,8 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 		onConnectDone()
 		return 0
 	case wmVideoCaps:
+		applySettings() // tell the servers what we can decode
 		if cur.Load() != nil {
-			applySettings() // tell the server what we can decode
 			if note := videoNote(); note != "" {
 				setStatus(strings.TrimSpace(note))
 			}
@@ -1436,20 +1398,28 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 		}
 		return 0
 	case wmStatus:
-		if s := statusText.Swap(nil); s != nil && cur.Load() != nil {
-			text := *s
-			if strings.HasPrefix(text, "Connected to ") {
-				text += videoNote() // e.g. that this PC lacks an H.265 decoder
+		if wParam == 0 { // not about one connection: clipboard sharing, say
+			if s := statusText.Swap(nil); s != nil && cur.Load() != nil {
+				setStatus(*s)
 			}
-			setStatus(text)
+			return 0
+		}
+		if tb := tabOfLink(wParam); tb != nil {
+			if s := tb.l.status.Swap(nil); s != nil {
+				text := *s
+				if strings.HasPrefix(text, "Connected to ") {
+					text += videoNote() // e.g. that this PC lacks an H.265 decoder
+				}
+				setTabStatus(tb, text)
+			}
 		}
 		return 0
 	case wmDisconnected:
 		onDisconnected(wParam)
 		return 0
 	case 0x0113: // WM_TIMER
-		if wParam == timerReconnect {
-			reconnectTimer()
+		if wParam >= timerReconnectBase {
+			reconnectTimer(wParam)
 			return 0
 		}
 		// Otherwise the once-a-second tick behind the frame-rate readout.
@@ -1511,9 +1481,11 @@ func destRect() (dx, dy, dw, dh, rw, rh int) {
 	var rc rect
 	pGetClientRect.Call(hView, uintptr(unsafe.Pointer(&rc)))
 	cw, ch := int(rc.right), int(rc.bottom)
-	fbMu.RLock()
-	rw, rh = fbW, fbH
-	fbMu.RUnlock()
+	if l := cur.Load(); l != nil {
+		l.fbMu.RLock()
+		rw, rh = l.fbW, l.fbH
+		l.fbMu.RUnlock()
+	}
 	if rw == 0 || rh == 0 || cw == 0 || ch == 0 {
 		return 0, 0, 0, 0, rw, rh
 	}
@@ -1601,8 +1573,8 @@ func viewProc(h, message, wParam, lParam uintptr) uintptr {
 		queue(proto.MsgWheel, p)
 		return 0
 	case wmSetCursor:
-		if lParam&0xFFFF == 1 && cur.Load() != nil { // HTCLIENT
-			pSetCursor.Call(curCursor.Load())
+		if l := cur.Load(); lParam&0xFFFF == 1 && l != nil { // HTCLIENT
+			pSetCursor.Call(l.cursor.Load())
 			return 1
 		}
 	case wmCursor:
@@ -1612,7 +1584,9 @@ func viewProc(h, message, wParam, lParam uintptr) uintptr {
 		var rc rect
 		pGetClientRect.Call(h, uintptr(unsafe.Pointer(&rc)))
 		if fg, _, _ := pGetForegroundWindow.Call(); fg == hMain && pt[0] >= 0 && pt[1] >= 0 && pt[0] < rc.right && pt[1] < rc.bottom {
-			pSetCursor.Call(curCursor.Load())
+			if l := cur.Load(); l != nil {
+				pSetCursor.Call(l.cursor.Load())
+			}
 		}
 		return 0
 	case wmRepaint:
@@ -1637,8 +1611,8 @@ func paint(h uintptr) {
 		text := "Not connected"
 		if cur.Load() != nil {
 			text = "Waiting for the remote screen..."
-		} else if viewNote != "" {
-			text = viewNote
+		} else if active != nil && active.viewNote != "" {
+			text = active.viewNote
 		}
 		old, _, _ := pSelectObject.Call(hdc, hFont)
 		pSetBkMode.Call(hdc, 1)
@@ -1655,8 +1629,13 @@ func paint(h uintptr) {
 		pPatBlt.Call(hdc, 0, 0, uintptr(cw), uintptr(dy), blackness)
 		pPatBlt.Call(hdc, 0, uintptr(dy+dh), uintptr(cw), uintptr(ch-dy-dh), blackness)
 	}
-	fbMu.Lock()
-	defer fbMu.Unlock()
+	l := cur.Load()
+	if l == nil {
+		return
+	}
+	l.fbMu.Lock()
+	defer l.fbMu.Unlock()
+	fb, fbW, fbH := l.fb, l.fbW, l.fbH
 	if fb == nil {
 		return
 	}
@@ -1719,6 +1698,11 @@ func keyboardHook(nCode, wParam, lParam uintptr) uintptr {
 	k := *(*kbdllHook)(unsafe.Pointer(lParam))
 	up := k.flags&0x80 != 0
 	id := k.vk | (k.flags&1)<<16
+	if up {
+		delete(keysDown, k.vk)
+	} else {
+		keysDown[k.vk] = true
+	}
 
 	// A key belongs to whichever PC saw it go down. If this PC saw the
 	// press (say Shift held while dragging the window), it must also see
@@ -1736,7 +1720,7 @@ func keyboardHook(nCode, wParam, lParam uintptr) uintptr {
 		focus, _, _ := pGetFocus.Call()
 		forward = fg == hMain && focus == hView
 	}
-	if _, remote := pressed[id]; up && !remote && !(k.vk == 0x0D && swallowEnter) && !(k.vk == 0x23 && swallowEnd) {
+	if _, remote := pressed[id]; up && !remote && !swallowing[k.vk] {
 		forward = false // a release we never sent the press for
 	}
 	if !forward {
@@ -1750,41 +1734,41 @@ func keyboardHook(nCode, wParam, lParam uintptr) uintptr {
 	}
 
 	const vkReturn, vkEnd, vkLCtrl, vkRCtrl, vkLAlt, vkRAlt = 0x0D, 0x23, 0xA2, 0xA3, 0xA4, 0xA5
+	// Whether any of these keys is down. Switching tabs lifts the keys
+	// held on the PC being left, so this goes by the keyboard itself: then
+	// Ctrl+Alt can stay down while stepping through several tabs.
 	held := func(vks ...uint32) bool {
 		for _, v := range vks {
-			for _, p := range pressed {
-				if p.vk == v {
-					return true
-				}
+			if keysDown[v] {
+				return true
 			}
 		}
 		return false
 	}
-	if k.vk == vkEnd {
-		// Ctrl+Alt+End stands in for Ctrl+Alt+Del, which Windows always
-		// keeps for this PC.
+	// Our own shortcuts, all with Ctrl+Alt held. The key's press and
+	// release are both kept from the remote PC.
+	const vkPageUp, vkPageDown = 0x21, 0x22
+	if k.vk == vkEnd || k.vk == vkReturn || k.vk == vkPageUp || k.vk == vkPageDown {
 		if !up && held(vkLCtrl, vkRCtrl) && held(vkLAlt, vkRAlt) {
-			if !swallowEnd {
-				swallowEnd = true
-				queue(proto.MsgAction, []byte{proto.ActionCtrlAltDel})
+			if !swallowing[k.vk] {
+				swallowing[k.vk] = true
+				switch k.vk {
+				case vkEnd:
+					// Stands in for Ctrl+Alt+Del, which Windows always
+					// keeps for this PC.
+					queue(proto.MsgAction, []byte{proto.ActionCtrlAltDel})
+				case vkReturn:
+					pPostMessage.Call(hMain, wmFullscreen, 0, 0)
+				case vkPageDown:
+					pPostMessage.Call(hMain, wmSwitchTab, 1, 0) // the next tab
+				case vkPageUp:
+					pPostMessage.Call(hMain, wmSwitchTab, 0, 0) // the previous tab
+				}
 			}
 			return 1
 		}
-		if up && swallowEnd {
-			swallowEnd = false
-			return 1
-		}
-	}
-	if k.vk == vkReturn {
-		if !up && held(vkLCtrl, vkRCtrl) && held(vkLAlt, vkRAlt) {
-			if !swallowEnter {
-				swallowEnter = true
-				pPostMessage.Call(hMain, wmFullscreen, 0, 0)
-			}
-			return 1
-		}
-		if up && swallowEnter {
-			swallowEnter = false
+		if up && swallowing[k.vk] {
+			delete(swallowing, k.vk)
 			return 1
 		}
 	}

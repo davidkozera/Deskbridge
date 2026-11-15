@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -45,10 +46,8 @@ var (
 	pDestroyWindow = user32.NewProc("DestroyWindow")
 
 	latestRelease atomic.Pointer[update.Release] // newest published version, once known
-	serverVersion atomic.Pointer[string]         // the connected server's version, if it said
 	updateText    atomic.Pointer[string]
 	setupFile     atomic.Pointer[string]
-	updateResult  = make(chan []byte, 1) // the server's answer to an update
 
 	// Touched only on the UI thread.
 	hUpdate       uintptr
@@ -87,43 +86,51 @@ func watchForUpdates() {
 	}
 }
 
+// liveServer is a connected server that should be updated, with the name
+// of its connection.
+type liveServer struct {
+	l    *link
+	name string
+}
+
 // updatePlan works out what, if anything, should be updated: the version to
-// move to, whether this PC and the connected PC each need it, and which of
-// the other saved servers do.
-func updatePlan() (target string, client, server bool, rest []savedServer) {
+// move to, whether this PC needs it, which of the connected PCs do, and
+// which of the other saved servers do.
+func updatePlan() (target string, client bool, live []liveServer, rest []savedServer) {
 	target = proto.Version
 	if r := latestRelease.Load(); r != nil && update.Newer(r.Version, target) {
 		target = r.Version
 	}
-	if v := serverVersion.Load(); v != nil && cur.Load() != nil {
-		server = update.Newer(target, *v)
+	for _, tb := range tabs {
+		if l := tb.l; l != nil {
+			if v := l.version.Load(); v != nil && update.Newer(target, *v) {
+				live = append(live, liveServer{l, tb.target.name})
+			}
+		}
 	}
-	return target, update.Newer(target, proto.Version), server, behind(target)
+	return target, update.Newer(target, proto.Version), live, behind(target)
 }
 
 // refreshUpdate shows or hides the Update button.
 func refreshUpdate() {
 	refreshVersionLine() // the server's version may have just arrived or gone
-	target, client, server, rest := updatePlan()
-	updateOffered = client || server || len(rest) > 0
-	count := len(rest)
+	target, client, live, rest := updatePlan()
+	count := len(live) + len(rest)
 	if client {
 		count++
 	}
-	if server {
-		count++
-	}
+	updateOffered = count > 0
 	switch {
-	case len(rest) > 0 && count == 1:
-		setText(hUpdate, "Update 1 saved PC to "+target)
-	case len(rest) > 0:
-		setText(hUpdate, "Update "+strconv.Itoa(count)+" PCs to "+target)
-	case client && server:
-		setText(hUpdate, "Update both PCs to "+target)
-	case client:
+	case count == 1 && client:
 		setText(hUpdate, "Update to version "+target)
-	case server:
+	case count == 1 && len(live) == 1:
 		setText(hUpdate, "Update the remote PC to "+target)
+	case count == 1:
+		setText(hUpdate, "Update 1 saved PC to "+target)
+	case count == 2 && client && len(live) == 1:
+		setText(hUpdate, "Update both PCs to "+target)
+	case count > 1:
+		setText(hUpdate, "Update "+strconv.Itoa(count)+" PCs to "+target)
 	}
 	enabled := uintptr(1)
 	if updating {
@@ -141,14 +148,13 @@ func updateProgress(s string) {
 
 // startUpdate runs when the button is clicked.
 func startUpdate() {
-	target, client, server, rest := updatePlan()
-	if updating || (!client && !server && len(rest) == 0) {
+	target, client, live, rest := updatePlan()
+	if updating || (!client && len(live) == 0 && len(rest) == 0) {
 		return
 	}
 	updating = true
 	refreshUpdate()
 	openPane()
-	l := cur.Load()
 	go func() {
 		done := func(s string) {
 			updateText.Store(&s)
@@ -174,7 +180,7 @@ func startUpdate() {
 			return
 		}
 
-		// The other saved servers and the connected one, all at once.
+		// The connected servers and the other saved ones, all at once.
 		others := make(chan string, 1)
 		go func() {
 			if len(rest) == 0 {
@@ -183,12 +189,30 @@ func startUpdate() {
 			}
 			others <- updateServers(rest, target, signature, installer)
 		}()
-		remote := ""
-		if server && l != nil && cur.Load() == l {
+		if len(live) == 1 {
 			updateProgress("Sending version " + target + " to the remote PC...")
-			remote = pushUpdate(l, target, signature, installer)
-		} else if len(rest) > 0 {
-			updateProgress("Sending version " + target + " to the saved PCs...")
+		} else if len(live)+len(rest) > 0 {
+			updateProgress("Sending version " + target + " to the other PCs...")
+		}
+		verdicts := make([]string, len(live))
+		var wg sync.WaitGroup
+		for i, s := range live {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				verdicts[i] = pushUpdate(s.l, target, signature, installer)
+			}()
+		}
+		wg.Wait()
+		remote := ""
+		switch {
+		case len(live) == 1:
+			remote = "The remote PC " + verdicts[0]
+		case len(live) > 1:
+			remote = "Connected PCs:"
+			for i, s := range live {
+				remote += "\r\n" + s.name + ": " + verdicts[i]
+			}
 		}
 		if lines := <-others; lines != "" {
 			if remote != "" {
@@ -219,11 +243,11 @@ func startUpdate() {
 	}()
 }
 
-// pushUpdate sends the setup program to the server and waits for its
-// verdict, which it returns as a sentence for the pane.
+// pushUpdate sends the setup program to a connected server and waits for
+// its verdict, which it returns as the end of a sentence about that PC.
 func pushUpdate(l *link, version, signature string, installer []byte) string {
 	select { // forget any stale answer
-	case <-updateResult:
+	case <-l.updateResult:
 	default:
 	}
 	send := func(t byte, p []byte) bool {
@@ -240,22 +264,22 @@ func pushUpdate(l *link, version, signature string, installer []byte) string {
 	}
 	ok = ok && send(proto.MsgUpdateEnd, nil)
 	if !ok {
-		return "The remote PC was not updated: the connection closed."
+		return "was not updated: the connection closed."
 	}
 	select {
-	case r := <-updateResult:
+	case r := <-l.updateResult:
 		if len(r) > 0 && r[0] == 1 {
-			return "The remote PC is installing version " + version + ". Its connection drops for a few seconds while it restarts."
+			return "is installing version " + version + ". Its connection drops for a few seconds while it restarts."
 		}
 		why := "it gave no reason."
 		if len(r) > 1 {
 			why = string(r[1:])
 		}
-		return "The remote PC was not updated: " + why
+		return "was not updated: " + why
 	case <-l.done:
-		return "The remote PC was not updated: the connection closed."
+		return "was not updated: the connection closed."
 	case <-time.After(2 * time.Minute):
-		return "The remote PC did not answer the update request."
+		return "did not answer the update request."
 	}
 }
 

@@ -75,6 +75,14 @@ func checkServers() {
 			list = append(list, o)
 		}
 	}
+	// Open tabs count too, saved or not: their passwords are at hand.
+	for _, tb := range tabs {
+		o := savedServer{name: tb.target.name, host: tb.target.host, port: tb.target.port, password: tb.target.password}
+		if !seen[o.key()] {
+			seen[o.key()] = true
+			list = append(list, o)
+		}
+	}
 	before := savedServers.Load()
 	go func() {
 		defer checking.Store(false)
@@ -108,20 +116,22 @@ func checkServers() {
 }
 
 // behind picks out the saved servers that should be updated to target,
-// leaving out the connected one, which is handled over its own connection.
-// Runs on the UI thread.
+// leaving out the connected ones, which are handled over their own
+// connections. Runs on the UI thread.
 func behind(target string) []savedServer {
 	list := savedServers.Load()
 	if list == nil {
 		return nil
 	}
-	connected := ""
-	if cur.Load() != nil {
-		connected = savedServer{host: lastTarget.host, port: lastTarget.port}.key()
+	connected := map[string]bool{}
+	for _, tb := range tabs {
+		if tb.l != nil {
+			connected[savedServer{host: tb.target.host, port: tb.target.port}.key()] = true
+		}
 	}
 	var out []savedServer
 	for _, o := range *list {
-		if o.key() == connected {
+		if connected[o.key()] {
 			continue
 		}
 		switch o.state {

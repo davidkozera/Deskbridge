@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"unsafe"
 
 	"deskbridge/internal/proto"
@@ -57,13 +56,13 @@ var usualResolutions = []resolution{
 }
 
 var (
-	remoteModes atomic.Pointer[modeList] // the latest from the server
-
 	// Touched only on the UI thread.
-	hRes         uintptr
-	wantedRes    resolution   // zero: leave the remote display as it is
-	resChoices   []resolution // what each entry in the list stands for
-	resRequested bool         // the saved choice has been asked for on this connection
+	hRes uintptr
+	// wantedRes is the resolution for the connection being set up, while
+	// no tab is open (zero: leave the remote display as it is). Each tab
+	// has its own.
+	wantedRes  resolution
+	resChoices []resolution // what each entry in the list stands for
 )
 
 // parseModes reads a MsgModes payload.
@@ -88,30 +87,60 @@ func hasResolution(list []resolution, r resolution) bool {
 	return false
 }
 
-// displayPending reports that the remote PC has been asked to show another
-// display and has not switched to it yet.
-func displayPending() bool {
-	d := remoteDisplays.Load()
-	if d == nil || wantedDisplay == noPreference {
+// displayPending reports that a tab's remote PC has been asked to show
+// another display and has not switched to it yet.
+func displayPending(tb *tab) bool {
+	d := tb.l.displays.Load()
+	if d == nil || tb.wantedDisplay == noPreference {
 		return false
 	}
-	valid := wantedDisplay < len(d.list) && (wantedDisplay >= 0 || len(d.list) > 1)
-	return valid && wantedDisplay != d.selected
+	valid := tb.wantedDisplay < len(d.list) && (tb.wantedDisplay >= 0 || len(d.list) > 1)
+	return valid && tb.wantedDisplay != d.selected
 }
 
-// showResolutions fills the list: with what the remote display offers while
-// connected, and otherwise with what it offered last time, or the usual
-// sizes for a connection that has not been made yet.
+// modesArrived runs when a tab's server has said which resolutions the
+// display it is showing offers.
+func modesArrived(tb *tab) {
+	m := tb.l.modes.Load()
+	if m == nil {
+		return
+	}
+	if i := findComputer(tb.target.name); i >= 0 && len(m.list) > 0 && fmt.Sprint(computers[i].modes) != fmt.Sprint(m.list) {
+		computers[i].modes = m.list // so the list is right before connecting next time
+		saveSettings()
+	}
+	// Set the display to this connection's resolution, once it is showing
+	// the display this connection wants. This applies to tabs behind the
+	// one in front too.
+	if len(m.list) > 0 && !tb.resRequested && !displayPending(tb) {
+		tb.resRequested = true
+		if r := tb.wantedRes; r.w != 0 && r != m.current && hasResolution(m.list, r) {
+			sendTo(tb.l, proto.MsgSetResolution, resolutionPayload(r))
+		}
+	}
+	if tb == active {
+		showResolutions()
+	}
+}
+
+// showResolutions fills the list for the tab in front: with what the
+// remote display offers while connected, and otherwise (or with no tab
+// open, for the connection named in the boxes) with what it offered last
+// time, or the usual sizes for a connection that has not been made yet.
 func showResolutions() {
 	connected := cur.Load() != nil
+	wantedRes := wantedRes
+	var m *modeList
+	if active != nil {
+		wantedRes = active.wantedRes
+		if active.l != nil {
+			m = active.l.modes.Load()
+		}
+	}
 	var offered []resolution
 	known, usable := false, true
-	if m := remoteModes.Load(); connected && m != nil {
+	if connected && m != nil {
 		offered, known, usable = m.list, true, len(m.list) > 0
-		if i := currentProfile(); i >= 0 && usable && fmt.Sprint(computers[i].modes) != fmt.Sprint(m.list) {
-			computers[i].modes = m.list // so the list is right before connecting next time
-			saveSettings()
-		}
 	} else if i := currentProfile(); i >= 0 && len(computers[i].modes) > 0 {
 		offered, known = computers[i].modes, true
 	} else {
@@ -144,20 +173,11 @@ func showResolutions() {
 		enable = 0 // all displays are shown together: there is no one display to set
 	}
 	pEnableWindow.Call(hRes, enable)
-
-	// Set the display to this connection's resolution, once it is showing
-	// the display this connection wants.
-	if m := remoteModes.Load(); connected && m != nil && usable && !resRequested && !displayPending() {
-		resRequested = true
-		if wantedRes.w != 0 && wantedRes != m.current && hasResolution(m.list, wantedRes) {
-			sendResolution(wantedRes)
-		}
-	}
 }
 
-func sendResolution(r resolution) {
+func resolutionPayload(r resolution) []byte {
 	p := binary.LittleEndian.AppendUint16(nil, uint16(r.w))
-	queue(proto.MsgSetResolution, binary.LittleEndian.AppendUint16(p, uint16(r.h)))
+	return binary.LittleEndian.AppendUint16(p, uint16(r.h))
 }
 
 // resolutionPicked runs when the person chooses an entry.
@@ -167,13 +187,18 @@ func resolutionPicked() {
 	if index < 0 || index >= len(resChoices) {
 		return
 	}
-	wantedRes, resRequested = resChoices[index], true
+	r := resChoices[index]
+	if active != nil {
+		active.wantedRes, active.resRequested = r, true
+	} else {
+		wantedRes = r
+	}
 	if p := currentProfile(); p >= 0 {
-		computers[p].res = wantedRes
+		computers[p].res = r
 	}
 	saveSettings()
 	if cur.Load() != nil {
-		sendResolution(wantedRes) // 0 x 0 puts the display back as it was
+		queue(proto.MsgSetResolution, resolutionPayload(r)) // 0 x 0 puts the display back as it was
 		pSetFocus.Call(hView)
 	}
 }

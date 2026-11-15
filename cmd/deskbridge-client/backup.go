@@ -188,7 +188,7 @@ func importConnections() {
 		}
 	}
 	fillComputers()
-	if i := currentProfile(); i >= 0 && cur.Load() == nil && !reconnecting {
+	if i := currentProfile(); i >= 0 {
 		loadProfile(i) // the connection in the boxes may have been replaced
 	}
 	saveSettings()
