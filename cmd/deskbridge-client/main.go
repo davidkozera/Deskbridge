@@ -1665,6 +1665,13 @@ func viewProc(h, message, wParam, lParam uintptr) uintptr {
 		return 0
 	case wmEraseBkgnd:
 		return 1
+	case wmSize:
+		// The picture is scaled to fit, so a new size means all of it
+		// must be drawn again. Left to itself Windows keeps what is on
+		// screen and asks only for the newly uncovered part, which leaves
+		// two scales side by side until the next frame happens to arrive.
+		pInvalidateRect.Call(h, 0, 0)
+		return 0
 	case wmKillFocus:
 		releaseKeys()
 		return 0
