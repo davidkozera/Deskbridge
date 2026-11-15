@@ -529,7 +529,13 @@ func buildPane() {
 	label("Password")
 	hPass = edit(esPassword)
 	hRemember = check(idRemember, "Remember password")
-	hForget = control("BUTTON", "Forget this connection", wsTabStop, 0, m, y, w, 26, idForget)
+	// Save keeps what is in the boxes (and is how a connection is renamed);
+	// Forget removes the one named.
+	// More holds exporting the list to a file and importing it.
+	const third = (w - 12) / 3
+	hSave = control("BUTTON", "Save", wsTabStop, 0, m, y, third, 26, idSave)
+	hForget = control("BUTTON", "Forget", wsTabStop, 0, m+third+6, y, third, 26, idForget)
+	hMore = control("BUTTON", "More  \u25BE", wsTabStop, 0, m+2*(third+6), y, w-2*(third+6), 26, idMore)
 	pEnableWindow.Call(hForget, 0)
 	y += 34
 	hConnect = control("BUTTON", "Connect", bsDefPush|wsTabStop, 0, m, y, w, 32, idConnect)
@@ -1311,6 +1317,10 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 		showResolutions()
 		return 0
 	}
+	if message == wmNewConnection {
+		newConnection()
+		return 0
+	}
 	switch message {
 	case wmSize:
 		layout()
@@ -1345,6 +1355,10 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 			resolutionPicked()
 		case id == idForget && code == 0:
 			forgetComputer()
+		case id == idSave && code == 0:
+			saveConnection()
+		case id == idMore && code == 0:
+			moreMenu()
 		case (id == idFPS || id == idQuality) && code == 1, // CBN_SELCHANGE
 			(id == idAudio || id == idSleep || id == idRemember || id == idClipboard || id == idVideo || id == idFast) && code == 0:
 			applySettings()

@@ -21,9 +21,14 @@ import (
 const (
 	idName   = 114
 	idForget = 115
+	idSave   = 117
+
+	wmNewConnection = wmApp + 18 // main: "New connection..." was picked from the list
 
 	timerFrameRate = 1
 	timerReconnect = 2
+
+	maxComputers = 50 // how many saved connections are kept
 )
 
 // computer is one saved connection. The name is whatever the person likes
@@ -56,7 +61,7 @@ var (
 	pSetTimer  = user32.NewProc("SetTimer")
 
 	// Touched only on the UI thread.
-	hForget           uintptr
+	hForget, hSave    uintptr
 	computers         []computer // most recently used first
 	pickedName        string     // the saved connection the boxes were last filled from
 	lastTarget        target     // what the current or last connection used
@@ -97,7 +102,7 @@ func cleanName(s string) string {
 // its computer; and with only the first box filled in, what is typed there
 // is the computer (or the name of a saved connection).
 func typedTarget() target {
-	t := target{name: cleanName(getText(hName)), host: strings.TrimSpace(getText(hHost)), port: getText(hPort), password: getText(hPass)}
+	t := target{name: cleanName(getText(hName)), host: cleanName(getText(hHost)), port: getText(hPort), password: getText(hPass)}
 	if t.host == "" {
 		t.host = t.name
 		if i := findComputer(t.name); i >= 0 {
@@ -137,6 +142,10 @@ func fillComputers() {
 	for _, c := range computers {
 		pSendMessage.Call(hName, 0x0143, 0, uintptr(unsafe.Pointer(u16ptr(c.name))))
 	}
+	if len(computers) > 0 {
+		// Last in the list: empties the boxes for one that is not saved yet.
+		pSendMessage.Call(hName, 0x0143, 0, uintptr(unsafe.Pointer(u16ptr("New connection..."))))
+	}
 	setText(hName, typed)
 	forgettable := uintptr(0)
 	if findComputer(cleanName(typed)) >= 0 {
@@ -149,6 +158,12 @@ func fillComputers() {
 func computerPicked() {
 	i, _, _ := pSendMessage.Call(hName, 0x0147, 0, 0) // CB_GETCURSEL
 	index := int(int32(i))
+	if index == len(computers) && index > 0 {
+		// The list puts the entry's own text in the box after telling us,
+		// so empty the boxes once it has.
+		pPostMessage.Call(hMain, wmNewConnection, 0, 0)
+		return
+	}
 	if index < 0 || index >= len(computers) {
 		return
 	}
@@ -168,33 +183,110 @@ func computerPicked() {
 	}
 }
 
-// rememberComputer records a connection that was just made, at the top of
-// the list.
-func rememberComputer(t target) {
-	c := computer{name: t.name, host: t.host, port: t.port, res: wantedRes, display: wantedDisplay}
+// newConnection empties the boxes, ready for a connection that is not in
+// the list yet.
+func newConnection() {
+	pickedName = ""
+	setText(hName, "")
+	setText(hHost, "")
+	setText(hPass, "")
+	setText(hPort, proto.DefaultPort)
+	if cur.Load() == nil && !reconnecting {
+		wantedDisplay, wantedRes = noPreference, resolution{}
+		showResolutions()
+	}
+	pEnableWindow.Call(hForget, 0)
+	pSetFocus.Call(hName)
+}
+
+// entryFor finds the saved connection that what is in the boxes belongs
+// to, or -1 if it is a new one. Boxes that were filled from a saved
+// connection still belong to it after its name or its computer has been
+// changed (that is how one is renamed or given a new address), but not
+// after both have, and not if the name now typed is another connection's.
+func entryFor(t target) int {
+	byName := findComputer(t.name)
+	if byName >= 0 {
+		return byName
+	}
+	if i := findComputer(pickedName); i >= 0 && strings.EqualFold(computers[i].host, t.host) {
+		return i
+	}
+	return -1
+}
+
+// storeConnection writes what is in the boxes to the list: over the saved
+// connection they belong to, or as a new one. inUse says this is the
+// connection being made or used right now, whose display and resolution
+// are the ones in effect. It returns the entry's place in the list.
+func storeConnection(t target, inUse bool) int {
+	i := entryFor(t)
+	c := computer{display: noPreference}
+	if i >= 0 {
+		c = computers[i]
+	}
+	renamedFrom := c.name
+	c.name, c.host, c.port = t.name, t.host, t.port
+	c.password = nil
 	if checked(hRemember) {
 		c.password = dpapi(pCryptProtectData, []byte(t.password))
 	}
-	// Giving a name to a connection that only went by its computer's name
-	// or address renames it instead of leaving the old entry behind.
-	if i := findComputer(pickedName); i >= 0 && !strings.EqualFold(pickedName, t.name) &&
-		strings.EqualFold(computers[i].name, computers[i].host) && strings.EqualFold(computers[i].host, t.host) {
-		c.modes = computers[i].modes
-		computers = append(computers[:i], computers[i+1:]...)
+	switch {
+	case inUse:
+		c.res, c.display = wantedRes, wantedDisplay
+	case cur.Load() == nil && !reconnecting:
+		c.res = wantedRes // what the resolution list shows
 	}
-	if i := findComputer(t.name); i >= 0 {
-		c.modes = computers[i].modes
-		computers = append(computers[:i], computers[i+1:]...)
+	if i >= 0 {
+		computers[i] = c
+	} else {
+		computers = append([]computer{c}, computers...)
+		if len(computers) > maxComputers {
+			computers = computers[:maxComputers]
+		}
+		i = 0
 	}
-	computers = append([]computer{c}, computers...)
-	if len(computers) > 20 {
-		computers = computers[:20]
+	// Renaming the connection in use: everything that goes by its name
+	// follows.
+	if renamedFrom != "" && strings.EqualFold(lastTarget.name, renamedFrom) && !strings.EqualFold(renamedFrom, t.name) {
+		lastTarget.name = t.name
+		if l := cur.Load(); l != nil {
+			l.name = t.name
+			pPostMessage.Call(hMain, wmRemoteSize, l.id, 0) // the title shows the name
+		}
 	}
 	pickedName = t.name
 	setText(hName, t.name)
 	setText(hHost, t.host)
+	return i
+}
+
+// rememberComputer records a connection that was just made, at the top of
+// the list.
+func rememberComputer(t target) {
+	i := storeConnection(t, true)
+	c := computers[i]
+	computers = append(computers[:i], computers[i+1:]...)
+	computers = append([]computer{c}, computers...)
 	fillComputers()
 	saveSettings()
+	checkServers() // the list or a password may have changed
+}
+
+// saveConnection runs when Save is clicked: it keeps what is in the boxes
+// without connecting, which is also how a connection is renamed.
+func saveConnection() {
+	t := typedTarget()
+	if t.host == "" {
+		setStatus("Enter the computer's name or IP address first, and a name for the connection if you want one.")
+		return
+	}
+	using := (cur.Load() != nil || reconnecting) && entryFor(t) >= 0 && entryFor(t) == findComputer(lastTarget.name)
+	storeConnection(t, using)
+	fillComputers()
+	saveSettings()
+	setStatus("Saved the connection \"" + t.name + "\" (" + t.host + ").")
+	checkServers()
 }
 
 // forgetComputer removes the connection named in the box from the list,

@@ -5,14 +5,17 @@ package main
 // The Update button.
 //
 // The client looks for a newer published version when it starts (and a few
-// times a day after that). It also learns the connected server's version.
-// If either this PC or the remote PC is behind, an Update button appears in
-// the pane and the window title says so.
+// times a day after that). It also learns the connected server's version,
+// and asks the other saved servers for theirs (see fleet.go). If this PC or
+// any of those servers is behind, an Update button appears in the pane and
+// the window title says so.
 //
 // One click then: downloads the setup program and checks its signature;
-// sends it to the server over the existing connection, where it is checked
-// again and installed; and finally updates this PC, which needs one Windows
-// administrator prompt, after which the client reopens by itself.
+// sends it to the connected server over the existing connection and to the
+// other saved servers over connections of their own, all at once, where it
+// is checked again and installed; and finally updates this PC, which needs
+// one Windows administrator prompt, after which the client reopens by
+// itself.
 
 import (
 	"context"
@@ -79,13 +82,15 @@ func watchForUpdates() {
 			latestRelease.Store(&rel)
 			pPostMessage.Call(hMain, wmUpdateInfo, 0, 0)
 		}
+		pPostMessage.Call(hMain, wmCheckServers, 0, 0)
 		time.Sleep(6 * time.Hour)
 	}
 }
 
 // updatePlan works out what, if anything, should be updated: the version to
-// move to, and whether this PC and the remote PC each need it.
-func updatePlan() (target string, client, server bool) {
+// move to, whether this PC and the connected PC each need it, and which of
+// the other saved servers do.
+func updatePlan() (target string, client, server bool, rest []savedServer) {
 	target = proto.Version
 	if r := latestRelease.Load(); r != nil && update.Newer(r.Version, target) {
 		target = r.Version
@@ -93,15 +98,26 @@ func updatePlan() (target string, client, server bool) {
 	if v := serverVersion.Load(); v != nil && cur.Load() != nil {
 		server = update.Newer(target, *v)
 	}
-	return target, update.Newer(target, proto.Version), server
+	return target, update.Newer(target, proto.Version), server, behind(target)
 }
 
 // refreshUpdate shows or hides the Update button.
 func refreshUpdate() {
 	refreshVersionLine() // the server's version may have just arrived or gone
-	target, client, server := updatePlan()
-	updateOffered = client || server
+	target, client, server, rest := updatePlan()
+	updateOffered = client || server || len(rest) > 0
+	count := len(rest)
+	if client {
+		count++
+	}
+	if server {
+		count++
+	}
 	switch {
+	case len(rest) > 0 && count == 1:
+		setText(hUpdate, "Update 1 saved PC to "+target)
+	case len(rest) > 0:
+		setText(hUpdate, "Update "+strconv.Itoa(count)+" PCs to "+target)
 	case client && server:
 		setText(hUpdate, "Update both PCs to "+target)
 	case client:
@@ -125,8 +141,8 @@ func updateProgress(s string) {
 
 // startUpdate runs when the button is clicked.
 func startUpdate() {
-	target, client, server := updatePlan()
-	if updating || (!client && !server) {
+	target, client, server, rest := updatePlan()
+	if updating || (!client && !server && len(rest) == 0) {
 		return
 	}
 	updating = true
@@ -158,10 +174,27 @@ func startUpdate() {
 			return
 		}
 
+		// The other saved servers and the connected one, all at once.
+		others := make(chan string, 1)
+		go func() {
+			if len(rest) == 0 {
+				others <- ""
+				return
+			}
+			others <- updateServers(rest, target, signature, installer)
+		}()
 		remote := ""
 		if server && l != nil && cur.Load() == l {
 			updateProgress("Sending version " + target + " to the remote PC...")
 			remote = pushUpdate(l, target, signature, installer)
+		} else if len(rest) > 0 {
+			updateProgress("Sending version " + target + " to the saved PCs...")
+		}
+		if lines := <-others; lines != "" {
+			if remote != "" {
+				remote += "\r\n\r\n"
+			}
+			remote += "Other saved PCs:\r\n" + lines
 		}
 		if !client {
 			done(remote)
@@ -232,6 +265,8 @@ func updateMessage(message, wParam uintptr) bool {
 	switch message {
 	case wmUpdateInfo:
 		refreshUpdate()
+	case wmCheckServers:
+		checkServers()
 	case wmUpdateStatus:
 		if s := updateText.Swap(nil); s != nil {
 			updateNote, updateNoteAt = *s, time.Now()

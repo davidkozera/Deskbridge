@@ -279,10 +279,14 @@ func serve(nc net.Conn, cfg *tls.Config, key []byte) {
 	if tc, ok := nc.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)
 	}
-	tc, err := proto.ServerHandshake(nc, cfg, key)
+	tc, role, err := proto.ServerHandshake(nc, cfg, key)
 	if err != nil {
 		log.Printf("%s: rejected (%v)", remote, err)
 		nc.Close()
+		return
+	}
+	if role == proto.RoleMaintenance {
+		serveMaintenance(tc, remote)
 		return
 	}
 	s := &session{c: proto.NewConn(tc), done: make(chan struct{})}
@@ -312,6 +316,30 @@ func serve(nc net.Conn, cfg *tls.Config, key []byte) {
 	peer.Close()
 	restoreResolutionsLater()
 	log.Printf("%s: disconnected", remote)
+}
+
+// serveMaintenance answers a client that only wants to know this server's
+// version and, if it is behind, hand it an update. Nothing is shown or
+// controlled, and whoever is using the PC remotely is left alone (until an
+// update restarts the server, which they then ride out by reconnecting).
+func serveMaintenance(tc *tls.Conn, remote string) {
+	s := &session{c: proto.NewConn(tc), done: make(chan struct{})}
+	defer s.close()
+	log.Printf("%s: maintenance connection", remote)
+	s.c.Send(proto.MsgNotice, true, append([]byte{proto.NoticeVersion}, proto.Version...))
+	for {
+		tc.SetReadDeadline(time.Now().Add(2 * time.Minute))
+		t, p, err := s.c.Read()
+		if err != nil {
+			return
+		}
+		switch t {
+		case proto.MsgPing:
+			s.c.Send(proto.MsgPong, true)
+		case proto.MsgUpdateBegin, proto.MsgUpdateData, proto.MsgUpdateEnd:
+			s.update.handle(s, t, p)
+		}
+	}
 }
 
 // ---------- clipboard ----------

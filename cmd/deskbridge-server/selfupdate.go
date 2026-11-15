@@ -18,12 +18,18 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"deskbridge/internal/proto"
 	"deskbridge/internal/update"
 )
+
+// installing is set once an update has been verified and setup is about to
+// run, so that a second copy arriving at the same moment (over another
+// connection) does not trip over the first.
+var installing atomic.Bool
 
 type updateReceiver struct {
 	active       bool
@@ -80,6 +86,10 @@ func (u *updateReceiver) handle(s *session, t byte, p []byte) {
 			return
 		}
 		u.active, u.buf = false, nil
+		if !installing.CompareAndSwap(false, true) {
+			refuse("an update is already being installed.")
+			return
+		}
 		// Keep it in our own folder, which only administrators can write
 		// to, so nothing can swap the file between this check and running it.
 		exe, _ := os.Executable()
@@ -87,10 +97,12 @@ func (u *updateReceiver) handle(s *session, t byte, p []byte) {
 		os.RemoveAll(dir)
 		path := filepath.Join(dir, update.AssetName(version))
 		if err := os.MkdirAll(dir, 0755); err != nil {
+			installing.Store(false)
 			refuse("the update could not be saved: " + err.Error())
 			return
 		}
 		if err := os.WriteFile(path, installer, 0755); err != nil {
+			installing.Store(false)
 			refuse("the update could not be saved: " + err.Error())
 			return
 		}
@@ -103,6 +115,7 @@ func (u *updateReceiver) handle(s *session, t byte, p []byte) {
 			cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000 | 0x00000200} // no window, own process group
 			if err := cmd.Start(); err != nil {
 				log.Print("update: setup could not be started: ", err)
+				installing.Store(false)
 			}
 		}()
 	}

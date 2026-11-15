@@ -61,34 +61,67 @@ func proof(key []byte, role string, ekm []byte) []byte {
 
 var ErrAuth = errors.New("wrong password")
 
-func ServerHandshake(nc net.Conn, cfg *tls.Config, key []byte) (*tls.Conn, error) {
+// ErrNoMaintenance means the server turned a maintenance connection down
+// in the way a server from before version 1.5.0 turns anything down that it
+// does not recognise: it is either that old, or the password is wrong.
+var ErrNoMaintenance = errors.New("the server does not take maintenance connections")
+
+// A connection is made for one of two purposes. A client one shows and
+// controls the screen, and takes the place of any client already connected.
+// A maintenance one only asks the server's version and can hand it an
+// update; it disturbs nobody.
+const (
+	RoleClient      = "client"
+	RoleMaintenance = "maintenance"
+)
+
+// refusal is what a server answers to a wrong password. Servers before
+// 1.5.0 answered with zeros, which is how a newer client tells them apart.
+var refusal = append([]byte("deskbridge: wrong password"), make([]byte, 6)...)
+
+// ServerHandshake checks the other side's password proof and says which
+// kind of connection it asked for.
+func ServerHandshake(nc net.Conn, cfg *tls.Config, key []byte) (*tls.Conn, string, error) {
 	tc := tls.Server(nc, cfg)
 	tc.SetDeadline(time.Now().Add(10 * time.Second))
 	if err := tc.Handshake(); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	cs := tc.ConnectionState()
 	ekm, err := cs.ExportKeyingMaterial("deskbridge-auth", nil, 32)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	got := make([]byte, 32)
 	if _, err := io.ReadFull(tc, got); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	if !hmac.Equal(got, proof(key, "client", ekm)) {
+	role := ""
+	for _, r := range []string{RoleClient, RoleMaintenance} {
+		if hmac.Equal(got, proof(key, r, ekm)) {
+			role = r
+		}
+	}
+	if role == "" {
 		time.Sleep(time.Second)
-		tc.Write(make([]byte, 32))
-		return nil, ErrAuth
+		tc.Write(refusal)
+		return nil, "", ErrAuth
 	}
 	if _, err := tc.Write(proof(key, "server", ekm)); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	tc.SetDeadline(time.Time{})
-	return tc, nil
+	return tc, role, nil
 }
 
+// ClientHandshake connects as a client: see ClientHandshakeAs.
 func ClientHandshake(nc net.Conn, key []byte) (*tls.Conn, error) {
+	return ClientHandshakeAs(nc, key, RoleClient)
+}
+
+// ClientHandshakeAs proves knowledge of the password for the given kind of
+// connection and checks that the server knows it too.
+func ClientHandshakeAs(nc net.Conn, key []byte, role string) (*tls.Conn, error) {
 	tc := tls.Client(nc, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
 	tc.SetDeadline(time.Now().Add(10 * time.Second))
 	if err := tc.Handshake(); err != nil {
@@ -99,7 +132,7 @@ func ClientHandshake(nc net.Conn, key []byte) (*tls.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := tc.Write(proof(key, "client", ekm)); err != nil {
+	if _, err := tc.Write(proof(key, role, ekm)); err != nil {
 		return nil, err
 	}
 	got := make([]byte, 32)
@@ -107,6 +140,9 @@ func ClientHandshake(nc net.Conn, key []byte) (*tls.Conn, error) {
 		return nil, ErrAuth
 	}
 	if !hmac.Equal(got, proof(key, "server", ekm)) {
+		if role == RoleMaintenance && !hmac.Equal(got, refusal) {
+			return nil, ErrNoMaintenance
+		}
 		return nil, ErrAuth
 	}
 	tc.SetDeadline(time.Time{})

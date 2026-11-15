@@ -47,21 +47,29 @@ UPDATING
   New versions are published at
   https://github.com/davidkozera/Deskbridge/releases
 
-  The client checks there when it starts. When a newer version exists,
-  or the remote PC runs an older version than this one, an Update
-  button appears in the left pane and the window title says an update
-  is available. One click then:
+  The client checks there when it starts and a few times a day. It
+  also asks every saved connection that has a remembered password which
+  version its server runs, whether or not you are connected to it. This
+  check shows and controls nothing on those PCs and does not disturb
+  anyone using them. When a newer version exists, or any of those
+  servers runs an older version than this PC, an Update button appears
+  in the left pane, saying how many PCs it covers, and the window title
+  says an update is available. One click then:
 
     1. downloads the new setup program and checks its signature;
-    2. if you are connected, sends it to the remote PC, which checks
-       the signature itself and installs it (the connection drops for
-       a few seconds while its service restarts);
+    2. sends it to the connected PC and to every other saved server
+       that is behind and can be reached, all at the same time. Each
+       checks the signature itself and installs it (connections to it
+       drop for a few seconds while its service restarts);
     3. updates this PC. Windows asks for administrator approval once;
        the client then closes and reopens by itself.
 
-  Connect first if you want both PCs updated in one go. If you were not
-  connected, the button comes back the next time you connect, to bring
-  the remote PC up to date.
+  A saved server that is off, asleep or away is skipped and picked up
+  by a later check. One without a remembered password is updated the
+  next time you connect to it. Servers older than 1.5.0 cannot answer
+  the version check, so they are taken to need the update, and they
+  receive it over an ordinary connection, which takes the place of
+  anyone else connected to them at that moment.
 
   - Updates are only accepted if they carry the publisher's signature,
     so a tampered or unofficial setup program is refused on both PCs.
@@ -93,22 +101,42 @@ USING THE CLIENT
 
   Connection name              What you call this connection, such as
                                "Office laptop". It is also the list of
-                               saved connections: every one you make
-                               is kept, most recent first, and picking
-                               one fills in everything else. Leave it
-                               empty and the connection is called by
-                               its computer. Typing a new name over a
-                               connection you have named makes a second
-                               connection (handy for the same PC with a
-                               different display or resolution); use
-                               "Forget this connection" on the one you
-                               no longer want.
+                               saved connections, most recent first:
+                               picking one fills in everything else.
+                               Leave it empty and the connection is
+                               called by its computer. "New
+                               connection..." at the end of the list
+                               empties the boxes for one that is not
+                               saved yet (it can be for a PC that is
+                               already in the list, with another
+                               display or resolution).
   Computer / Port / Password   Where to connect: the remote PC's name
                                or IP address. Tick "Remember password"
                                to keep this connection's password
                                (encrypted for your Windows account).
-  Forget this connection       Removes the connection shown, and its
+  Save                         Keeps what is in the boxes without
+                               connecting. To rename a connection, pick
+                               it, type the new name and click Save;
+                               this works while connected too. A new
+                               address for a connection is saved the
+                               same way. Connecting saves as well.
+  Forget                       Removes the connection named, and its
                                saved password, from the list.
+  More                         Export connections: writes every saved
+                               connection (name, computer, port,
+                               password, resolution and display) to a
+                               CSV file, as a backup or to carry to
+                               another PC. The file holds the
+                               remembered passwords as plain text, so
+                               keep it somewhere only you can reach.
+                               Import connections: adds the connections
+                               in such a file to the list; one with the
+                               name of a saved connection replaces it.
+                               The file opens in Excel and can be
+                               edited there; its columns are Name,
+                               Computer, Port, Password, Resolution
+                               (such as 1920x1080) and Display (a
+                               number, or "all").
   Remote display               Which of the remote PC's displays to
                                show, or all of them side by side. Each
                                connection remembers its own. The list follows

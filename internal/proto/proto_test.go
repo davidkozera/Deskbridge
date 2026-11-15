@@ -2,7 +2,9 @@ package proto
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/binary"
+	"io"
 	"math"
 	"math/rand"
 	"net"
@@ -23,7 +25,7 @@ func pair(t *testing.T, spw, cpw string) (*Conn, *Conn, error, error) {
 	ch := make(chan res, 1)
 	go func() {
 		nc, _ := ln.Accept()
-		tc, err := ServerHandshake(nc, cfg, DeriveKey(spw))
+		tc, _, err := ServerHandshake(nc, cfg, DeriveKey(spw))
 		if err != nil {
 			nc.Close()
 			ch <- res{nil, err}
@@ -54,6 +56,51 @@ func TestHandshake(t *testing.T) {
 	_, _, se, ce = pair(t, "abcd-efgh", "wrong")
 	if se != ErrAuth || ce != ErrAuth {
 		t.Fatal("bad password accepted", se, ce)
+	}
+}
+
+// A maintenance connection is recognised as one, a wrong password on it is
+// reported as a wrong password, and a server from before maintenance
+// connections existed (which answers zeros) is told apart from both.
+func TestMaintenanceHandshake(t *testing.T) {
+	cfg, err := NewServerTLS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	try := func(serverPassword, clientPassword string, old bool) (string, error) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		role := make(chan string, 1)
+		go func() {
+			nc, _ := ln.Accept()
+			defer nc.Close()
+			if old {
+				tc := tls.Server(nc, cfg)
+				tc.Handshake()
+				io.ReadFull(tc, make([]byte, 32))
+				tc.Write(make([]byte, 32))
+				role <- ""
+				return
+			}
+			_, r, _ := ServerHandshake(nc, cfg, DeriveKey(serverPassword))
+			role <- r
+		}()
+		nc, _ := net.Dial("tcp", ln.Addr().String())
+		defer nc.Close()
+		_, cerr := ClientHandshakeAs(nc, DeriveKey(clientPassword), RoleMaintenance)
+		return <-role, cerr
+	}
+	if role, err := try("abcd-efgh", "abcd-efgh", false); err != nil || role != RoleMaintenance {
+		t.Fatal("maintenance connection not accepted:", role, err)
+	}
+	if _, err := try("abcd-efgh", "wrong", false); err != ErrAuth {
+		t.Fatal("wrong password on a maintenance connection:", err)
+	}
+	if _, err := try("abcd-efgh", "abcd-efgh", true); err != ErrNoMaintenance {
+		t.Fatal("old server not recognised:", err)
 	}
 }
 
