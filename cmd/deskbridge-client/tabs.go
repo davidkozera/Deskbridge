@@ -81,6 +81,13 @@ var (
 	nextTabID uintptr
 
 	connectResults = make(chan *connectResult, 64)
+
+	// From the settings file: the tabs that were open when the client was
+	// last closed, and the one that was in front. launchTabsKnown is false
+	// for a file from before these were kept.
+	launchTabs      []string
+	launchFront     string
+	launchTabsKnown bool
 )
 
 func tabByID(id uintptr) *tab {
@@ -320,6 +327,7 @@ func closeTab(tb *tab) {
 			break
 		}
 	}
+	saveSettings() // it is not to be opened again next time
 	if !wasActive {
 		pInvalidateRect.Call(hTabs, 0, 0)
 		refreshUpdate()
@@ -505,6 +513,47 @@ func connectAtLaunch() {
 	connectTo(tb, true)
 }
 
+// reopenTabs opens the tabs that were open when the client was last
+// closed: each saved connection among them that has a remembered password.
+// Like connectAtLaunch, each keeps trying until its PC answers.
+func reopenTabs() {
+	var opened []*tab
+	var front *tab
+	for _, name := range launchTabs {
+		i := findComputer(name)
+		if i < 0 || tabNamed(name) != nil || len(tabs) >= maxTabs {
+			continue
+		}
+		c := computers[i]
+		pw := dpapi(pCryptUnprotectData, c.password)
+		if pw == nil {
+			continue // no remembered password: it cannot be opened unasked
+		}
+		t := target{name: c.name, host: c.host, port: c.port, password: string(pw)}
+		tb := newTab(t)
+		tb.remember = true
+		tb.opts = readOptions()
+		if c.hasOpts {
+			tb.opts = c.opts
+		}
+		tb.wantedDisplay, tb.wantedRes = c.display, c.res
+		tb.reconnecting = true
+		tb.viewNote = "Connecting to " + t.name + "..."
+		tb.status = "Connecting to " + t.label() + "..."
+		opened = append(opened, tb)
+		if front == nil || strings.EqualFold(name, launchFront) {
+			front = tb
+		}
+	}
+	if front == nil {
+		return
+	}
+	activate(front, true)
+	for _, tb := range opened {
+		connectTo(tb, true)
+	}
+}
+
 // onConnectDone takes in the attempts that have finished.
 func onConnectDone() {
 	for {
@@ -680,28 +729,139 @@ func reconnectTimer(timer uintptr) {
 }
 
 // ---------- the strip of tabs ----------
+//
+// Along the top of the remote screen: a tab for each connection, then
+// "Send" (the same menu as the pane's "Send to remote PC") and "Full
+// screen". In full screen the strip is put away, and comes back as a
+// toolbar, centred at the top, when the pointer rests at the top edge of
+// the screen above it; it goes again once the pointer has left it.
 
-// tabWidth is how wide each tab is drawn, in pixels.
-func tabWidth() int {
-	var rc rect
-	pGetClientRect.Call(hTabs, uintptr(unsafe.Pointer(&rc)))
-	if len(tabs) == 0 {
-		return sc(190)
-	}
-	return max(min(sc(190), int(rc.right)/len(tabs)), sc(48))
+const (
+	tabCloseWidth  = 24 // the x at a tab's right-hand end, at 96 dpi
+	stripSendWidth = 74
+	stripFullWidth = 124
+
+	timerBarShow = 5 // the pointer has rested at the top edge: show the toolbar
+	timerBarHide = 6 // while the toolbar is on show: has the pointer left it?
+)
+
+var (
+	// Touched only on the UI thread.
+	barShown  bool // in full screen: the toolbar is on show
+	barArmed  bool // the pointer is at the top edge; the toolbar is about to appear
+	barMenu   bool // its Send menu is open
+	barMisses int  // how many checks in a row found the pointer away from it
+)
+
+// stripParts is where things are along the strip, in pixels.
+type stripParts struct {
+	width, tabW  int
+	sendX, fullX int // where "Send" and "Full screen" start
 }
 
-const tabCloseWidth = 24 // the x at a tab's right-hand end, at 96 dpi
+func stripGeometry() stripParts {
+	var rc rect
+	pGetClientRect.Call(hTabs, uintptr(unsafe.Pointer(&rc)))
+	g := stripParts{width: int(rc.right), tabW: sc(190)}
+	g.fullX = max(g.width-sc(stripFullWidth), 0)
+	g.sendX = max(g.fullX-sc(stripSendWidth), 0)
+	if n := len(tabs); n > 0 {
+		g.tabW = max(min(sc(190), g.sendX/n), sc(48))
+	}
+	return g
+}
+
+// barSpan is where the full-screen toolbar goes along a screen cw pixels
+// wide: only as wide as it needs to be, and centred, so that the corners
+// of the remote screen stay reachable.
+func barSpan(cw int) (x, w int) {
+	w = min(max(len(tabs)*sc(150)+sc(stripSendWidth+stripFullWidth), sc(420)), cw*8/10)
+	return (cw - w) / 2, w
+}
+
+// showBar shows or hides the full-screen toolbar.
+func showBar(on bool) {
+	pKillTimer.Call(hMain, timerBarShow)
+	barArmed = false
+	if barShown == on {
+		return
+	}
+	barShown, barMisses = on, 0
+	if on {
+		layout() // sized for the tabs there are now
+		const hwndTop, noMove, noSize, noActivate = 0, 0x2, 0x1, 0x10
+		pSetWindowPos.Call(hTabs, hwndTop, 0, 0, 0, 0, noMove|noSize|noActivate)
+		pInvalidateRect.Call(hTabs, 0, 0)
+		pSetTimer.Call(hMain, timerBarHide, 250, 0)
+		return
+	}
+	pKillTimer.Call(hMain, timerBarHide)
+	if fullscreen {
+		pShowWindow.Call(hTabs, 0)
+	}
+}
+
+// atTopEdge reports whether the pointer, at (cx, cy) in the view, is on
+// the strip of screen edge above where the toolbar appears.
+func atTopEdge(cx, cy int) bool {
+	if cy > sc(1) {
+		return false
+	}
+	var rc rect
+	pGetClientRect.Call(hView, uintptr(unsafe.Pointer(&rc)))
+	x, w := barSpan(int(rc.right))
+	return cx >= x && cx < x+w
+}
+
+// barPointer runs as the pointer moves over the remote screen in full
+// screen. Resting at the top edge for a moment brings the toolbar out; a
+// pointer only passing through does not.
+func barPointer(cx, cy int) {
+	if barShown {
+		return
+	}
+	switch edge := atTopEdge(cx, cy); {
+	case edge && !barArmed:
+		barArmed = true
+		pSetTimer.Call(hMain, timerBarShow, 300, 0)
+	case !edge && barArmed:
+		barArmed = false
+		pKillTimer.Call(hMain, timerBarShow)
+	}
+}
+
+// barTimer handles the toolbar's two timers.
+func barTimer(timer uintptr) {
+	var pt [2]int32
+	pGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	if timer == timerBarShow {
+		pKillTimer.Call(hMain, timerBarShow)
+		barArmed = false
+		at := pt
+		pScreenToClient.Call(hView, uintptr(unsafe.Pointer(&at)))
+		if fullscreen && atTopEdge(int(at[0]), int(at[1])) {
+			showBar(true)
+		}
+		return
+	}
+	if !fullscreen || !barShown {
+		pKillTimer.Call(hMain, timerBarHide)
+		return
+	}
+	if barMenu {
+		return
+	}
+	var rc rect
+	pGetWindowRect.Call(hTabs, uintptr(unsafe.Pointer(&rc)))
+	if pt[0] >= rc.left && pt[0] < rc.right && pt[1] >= rc.top && pt[1] < rc.bottom+int32(sc(12)) {
+		barMisses = 0
+	} else if barMisses++; barMisses >= 2 {
+		showBar(false)
+	}
+}
 
 func tabsProc(h, message, wParam, lParam uintptr) uintptr {
-	at := func() (*tab, bool) {
-		x := int(int16(lParam))
-		w := tabWidth()
-		if i := x / w; x >= 0 && i < len(tabs) {
-			return tabs[i], x >= (i+1)*w-sc(tabCloseWidth)
-		}
-		return nil, false
-	}
+	x := int(int16(lParam))
 	switch message {
 	case wmPaint:
 		paintTabs(h)
@@ -709,20 +869,37 @@ func tabsProc(h, message, wParam, lParam uintptr) uintptr {
 	case wmEraseBkgnd:
 		return 1
 	case wmLButtonDown:
-		if tb, onClose := at(); tb != nil {
-			if onClose {
-				closeTab(tb)
-			} else {
-				activate(tb, true)
-				if cur.Load() != nil {
-					pSetFocus.Call(hView)
+		g := stripGeometry()
+		switch {
+		case x >= g.fullX:
+			if cur.Load() != nil {
+				pPostMessage.Call(hMain, wmFullscreen, 0, 0)
+			}
+		case x >= g.sendX:
+			if cur.Load() != nil {
+				var rc rect
+				pGetWindowRect.Call(h, uintptr(unsafe.Pointer(&rc)))
+				barMenu = true
+				sendMenuAt(rc.left+int32(g.sendX), rc.bottom)
+				barMenu = false
+			}
+		default:
+			if i := x / g.tabW; x >= 0 && i < len(tabs) {
+				if tb := tabs[i]; x >= (i+1)*g.tabW-sc(tabCloseWidth) {
+					closeTab(tb)
+				} else {
+					activate(tb, true)
+					if cur.Load() != nil {
+						pSetFocus.Call(hView)
+					}
 				}
 			}
 		}
 		return 0
 	case wmMButtonUp:
-		if tb, _ := at(); tb != nil {
-			closeTab(tb)
+		g := stripGeometry()
+		if i := x / g.tabW; x >= 0 && x < g.sendX && i < len(tabs) {
+			closeTab(tabs[i])
 		}
 		return 0
 	}
@@ -751,12 +928,12 @@ func paintTabs(h uintptr) {
 	}
 	const single, vcentre, centre, noPrefix, ellipsis = 0x20, 0x4, 0x1, 0x800, 0x8000
 	height := int(rc.bottom)
-	fill(0, 0, int(rc.right), height, 15)
-	fill(0, height-1, int(rc.right), height, 16)
+	g := stripGeometry()
+	fill(0, 0, g.width, height, 15)
 	old, _, _ := pSelectObject.Call(hdc, hFont)
 	defer pSelectObject.Call(hdc, old)
 	pSetBkMode.Call(hdc, 1) // transparent
-	w := tabWidth()
+	w := g.tabW
 	for i, tb := range tabs {
 		x := i * w
 		label, ink := tb.target.name, uintptr(18)
@@ -777,6 +954,28 @@ func paintTabs(h uintptr) {
 			fill(x+w-1, sc(6), x+w, height-sc(6), 16)
 		}
 		text(label, x+sc(10), 0, x+w-sc(tabCloseWidth), height, ink, single|vcentre|noPrefix|ellipsis)
-		text("×", x+w-sc(tabCloseWidth), 0, x+w-sc(2), height, 17, single|vcentre|centre|noPrefix)
+		text("\u00D7", x+w-sc(tabCloseWidth), 0, x+w-sc(2), height, 17, single|vcentre|centre|noPrefix)
+	}
+	// "Send" and "Full screen", at the right-hand end (over any tabs that
+	// did not fit).
+	ink := uintptr(18)
+	if cur.Load() == nil {
+		ink = 17
+	}
+	fill(g.sendX, 0, g.width, height, 15)
+	fill(g.sendX, sc(6), g.sendX+1, height-sc(6), 16)
+	fill(g.fullX, sc(6), g.fullX+1, height-sc(6), 16)
+	text("Send  \u25BE", g.sendX, 0, g.fullX, height, ink, single|vcentre|centre|noPrefix)
+	label := "Full screen"
+	if fullscreen {
+		label = "Exit full screen"
+	}
+	text(label, g.fullX, 0, g.width, height, ink, single|vcentre|centre|noPrefix)
+	// A line under it; and as a toolbar floating over the picture, down
+	// its sides too.
+	fill(0, height-1, g.width, height, 16)
+	if fullscreen {
+		fill(0, 0, 1, height, 16)
+		fill(g.width-1, 0, g.width, height, 16)
 	}
 }

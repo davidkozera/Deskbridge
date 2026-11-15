@@ -495,16 +495,22 @@ func main() {
 			setText(hPass, args[1])
 		}
 	}
-	// The pane starts collapsed. With a computer and password already known
-	// we connect straight away; otherwise the pane opens so they can be
-	// entered.
-	ready := typedTarget().host != "" && getText(hPass) != ""
-	collapsed = ready
+	// The pane starts collapsed if there is something to connect to:
+	// the tabs that were open last time; or, when started with a computer
+	// to connect to (or by a version from before tabs were remembered),
+	// the connection in the boxes. Otherwise the pane opens so the details
+	// can be entered.
+	switch {
+	case len(os.Args) == 1 && launchTabsKnown:
+		reopenTabs()
+	case typedTarget().host != "" && getText(hPass) != "":
+		connectAtLaunch()
+	}
+	collapsed = len(tabs) > 0
 	layout()
 	pShowWindow.Call(hMain, 1)
-	if ready {
+	if collapsed {
 		pSetFocus.Call(hView)
-		connectAtLaunch()
 	} else {
 		pSetFocus.Call(hName)
 	}
@@ -703,20 +709,33 @@ func layout() {
 		x += sc(toggleWidth)
 	}
 	// The strip of tabs runs along the top of the remote screen whenever a
-	// connection is open, except in full screen.
-	y := 0
-	if len(tabs) > 0 && !fullscreen {
+	// connection is open. In full screen it takes no room: it floats over
+	// the top of the picture as a toolbar, and only while called for (see
+	// showBar).
+	y, takeY := 0, sc(8)
+	switch {
+	case len(tabs) > 0 && !fullscreen:
 		y = sc(tabsHeight)
+		takeY += y
 		pMoveWindow.Call(hTabs, uintptr(x), 0, uintptr(max(cw-x, 0)), uintptr(y), 1)
 		pShowWindow.Call(hTabs, 8)
-	} else {
+	case len(tabs) > 0:
+		bx, bw := barSpan(cw)
+		pMoveWindow.Call(hTabs, uintptr(bx), 0, uintptr(bw), uintptr(sc(tabsHeight)), 1)
+		show := uintptr(0)
+		if barShown {
+			show = 8
+		}
+		pShowWindow.Call(hTabs, show)
+		takeY += sc(tabsHeight) // clear of where the toolbar appears
+	default:
 		pShowWindow.Call(hTabs, 0)
 	}
 	pMoveWindow.Call(hView, uintptr(x), uintptr(y), uintptr(max(cw-x, 0)), uintptr(max(ch-y, 0)), 1)
 	// The Take control button sits at the top of the remote screen, in
 	// the middle, whenever another PC has control of it.
 	bw := min(sc(300), max(cw-x-sc(16), sc(120)))
-	pMoveWindow.Call(hTake, uintptr(x+max(cw-x-bw, 0)/2), uintptr(y+sc(8)), uintptr(bw), uintptr(sc(30)), 1)
+	pMoveWindow.Call(hTake, uintptr(x+max(cw-x-bw, 0)/2), uintptr(takeY), uintptr(bw), uintptr(sc(30)), 1)
 	showTakeControl()
 
 	// The version line sits at the bottom of the pane; the status text
@@ -868,6 +887,18 @@ func saveSettings() {
 		"fastcapture=" + b(checked(hFast)),
 		"remember=" + b(checked(hRemember)),
 	}
+	// The tabs to open again next time, and the one in front.
+	var open []string
+	for _, tb := range tabs {
+		if !tb.stopped() {
+			open = append(open, tb.target.name)
+		}
+	}
+	front := ""
+	if active != nil {
+		front = active.target.name
+	}
+	lines = append(lines, "open="+strings.Join(open, "|"), "front="+front)
 	if checked(hRemember) {
 		if enc := dpapi(pCryptProtectData, []byte(getText(hPass))); enc != nil {
 			lines = append(lines, "password="+hex.EncodeToString(enc))
@@ -920,6 +951,13 @@ func loadSettings() {
 			}
 		case "remember":
 			setChecked(hRemember, v == "1")
+		case "open":
+			launchTabsKnown = true
+			if v != "" {
+				launchTabs = strings.Split(v, "|")
+			}
+		case "front":
+			launchFront = v
 		case "password":
 			if enc, err := hex.DecodeString(v); err == nil {
 				lastPassword = enc
@@ -1505,6 +1543,10 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 			dropTimer(wParam)
 			return 0
 		}
+		if wParam == timerBarShow || wParam == timerBarHide {
+			barTimer(wParam)
+			return 0
+		}
 		// Otherwise the once-a-second tick behind the frame-rate readout.
 		n := int(framesShown.Swap(0))
 		if cur.Load() == nil {
@@ -1525,6 +1567,7 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 }
 
 func toggleFullscreen() {
+	showBar(false) // the toolbar belongs to the mode being left
 	h := hMain
 	const gwlStyle = ^uintptr(15) // -16
 	const swpFrameChanged, swpNoZOrder = 0x0020, 0x0004
@@ -1627,6 +1670,9 @@ func viewProc(h, message, wParam, lParam uintptr) uintptr {
 		return 0
 	case wmMouseMove:
 		localKeys = false
+		if fullscreen {
+			barPointer(int(int16(lParam)), int(int16(lParam>>16)))
+		}
 		if x, y, ok := remotePoint(lParam); ok {
 			queue(proto.MsgMouseMove, xy(x, y))
 		}

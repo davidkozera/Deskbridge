@@ -147,9 +147,16 @@ func displayPicked() {
 	pSetFocus.Call(hView)
 }
 
-// sendMenu shows the "Send to remote PC" menu under its button and carries
-// out the choice.
+// sendMenu shows the "Send to remote PC" menu under its button in the pane.
 func sendMenu() {
+	var rc rect
+	pGetWindowRect.Call(hSend, uintptr(unsafe.Pointer(&rc)))
+	sendMenuAt(rc.left, rc.bottom)
+}
+
+// sendMenuAt shows the "Send to remote PC" menu at a place on the screen
+// and carries out the choice.
+func sendMenuAt(x, y int32) {
 	if cur.Load() == nil {
 		return
 	}
@@ -168,10 +175,8 @@ func sendMenu() {
 	item(proto.ActionRestart, "Restart...")
 	item(proto.ActionShutDown, "Shut down...")
 
-	var rc rect
-	pGetWindowRect.Call(hSend, uintptr(unsafe.Pointer(&rc)))
 	// TPM_RETURNCMD | TPM_NONOTIFY: just tell us what was picked.
-	choice, _, _ := pTrackPopupMenu.Call(menu, 0x0100|0x0080, uintptr(rc.left), uintptr(rc.bottom), 0, hMain, 0)
+	choice, _, _ := pTrackPopupMenu.Call(menu, 0x0100|0x0080, uintptr(x), uintptr(y), 0, hMain, 0)
 	if choice == 0 {
 		return
 	}

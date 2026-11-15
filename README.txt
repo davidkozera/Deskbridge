@@ -82,10 +82,12 @@ USING THE CLIENT
   The left pane holds every setting; the remote screen is on the right.
   The narrow strip between them hides or shows the pane.
 
-  The pane starts hidden. If a computer name and remembered password are
-  saved, the client connects by itself on launch. The pane opens on its
-  own when details are missing, a connection fails, or you close the
-  last connection.
+  The pane starts hidden. On launch the client reopens the tabs that
+  were open when it was last closed (each saved connection among them
+  with a remembered password) and puts the same one in front. If none
+  were open it connects to nothing and the pane opens. The pane also
+  opens on its own when details are missing, a connection fails, or you
+  close the last connection.
 
   SEVERAL CONNECTIONS AT ONCE
   Each connection has a tab in the strip above the remote screen,
@@ -94,8 +96,16 @@ USING THE CLIENT
   already open stay connected (up to 12).
 
   - Click a tab to switch to it. Ctrl+Alt+PageDown and Ctrl+Alt+PageUp
-    step to the next and previous tab, which also works in full screen,
-    where the strip is hidden.
+    step to the next and previous tab, which also works in full screen.
+  - The strip ends with "Send" (the same menu as the pane's "Send to
+    remote PC": Ctrl+Alt+Del, Lock, Task Manager and so on) and "Full
+    screen", so neither needs the pane open.
+  - In full screen the strip is put away. Rest the pointer at the very
+    top edge of the screen, in the middle, and it drops down as a
+    toolbar: the tabs, Send, and "Exit full screen". It goes away once
+    the pointer has left it. It appears only over the middle of the
+    screen, so the remote PC's own top corners stay within reach, and
+    not for a pointer that is only passing the edge.
   - Click a tab's x, or middle-click the tab, to close that connection.
     The pane's Disconnect button closes the tab in front.
   - The tab in front is the one you see and control. It alone gets the
