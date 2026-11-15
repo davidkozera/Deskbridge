@@ -28,9 +28,31 @@ type Connection struct {
 	Name, Host, Port, Password string
 	Width, Height              int // 0, 0: leave the remote display's resolution as it is
 	Display                    int // DisplayNotSet, DisplayAll, or a display's index
+
+	// The connection's own settings. HasSettings is false for a row
+	// without them, which then takes whatever the client is set to.
+	HasSettings                                      bool
+	FPS, Quality                                     int
+	Sound, AllowSleep, CopyPaste, Video, FastCapture bool
 }
 
-var header = []string{"Name", "Computer", "Port", "Password", "Resolution", "Display"}
+var header = []string{"Name", "Computer", "Port", "Password", "Resolution", "Display",
+	"Frames per second", "Quality", "Sound", "Allow sleep", "Copy and paste", "Video for motion", "Fast capture"}
+
+func yesNo(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
+}
+
+func isYes(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "yes", "y", "true", "1", "on":
+		return true
+	}
+	return false
+}
 
 // Encode writes the connections as CSV, with a header row. It starts with
 // a byte-order mark so that spreadsheet programs read names with accents
@@ -52,7 +74,12 @@ func Encode(list []Connection) []byte {
 		case c.Display >= 0:
 			display = strconv.Itoa(c.Display + 1)
 		}
-		w.Write([]string{c.Name, c.Host, c.Port, c.Password, res, display})
+		row := []string{c.Name, c.Host, c.Port, c.Password, res, display}
+		if c.HasSettings {
+			row = append(row, strconv.Itoa(c.FPS), strconv.Itoa(c.Quality), yesNo(c.Sound), yesNo(c.AllowSleep),
+				yesNo(c.CopyPaste), yesNo(c.Video), yesNo(c.FastCapture))
+		}
+		w.Write(row)
 	}
 	w.Flush()
 	return b.Bytes()
@@ -70,7 +97,8 @@ func clean(s string) string {
 
 // Decode reads a file written by Encode, or one made by hand with the same
 // columns. Rows without a computer are left out; skipped says how many.
-// The header row is optional, and columns after the second may be missing.
+// The header row is optional, and columns after the second may be missing
+// (files from before version 1.7.0 have no settings columns).
 func Decode(data []byte) (list []Connection, skipped int, err error) {
 	data = bytes.TrimPrefix(data, []byte("\xEF\xBB\xBF"))
 	r := csv.NewReader(bytes.NewReader(data))
@@ -126,6 +154,15 @@ func Decode(data []byte) (list []Connection, skipped int, err error) {
 			if n, err := strconv.Atoi(d); err == nil && n >= 1 && n <= 16 {
 				c.Display = n - 1
 			}
+		}
+		// Settings count only if the row gives a sensible frame rate and
+		// quality; the yes/no columns then default to no.
+		fps, err1 := strconv.Atoi(strings.TrimSpace(field(6)))
+		quality, err2 := strconv.Atoi(strings.TrimSpace(field(7)))
+		if err1 == nil && err2 == nil && fps >= 1 && fps <= 120 && quality >= 1 && quality <= 100 {
+			c.HasSettings, c.FPS, c.Quality = true, fps, quality
+			c.Sound, c.AllowSleep, c.CopyPaste = isYes(field(8)), isYes(field(9)), isYes(field(10))
+			c.Video, c.FastCapture = isYes(field(11)), isYes(field(12))
 		}
 		if len(list) >= MaxConnections {
 			skipped++

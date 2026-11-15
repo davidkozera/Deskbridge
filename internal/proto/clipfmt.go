@@ -26,7 +26,7 @@ const (
 )
 
 // IsClipMsg reports whether t is one of the clipboard messages.
-func IsClipMsg(t byte) bool { return t >= MsgClipBlobBegin && t <= MsgClipState }
+func IsClipMsg(t byte) bool { return t >= MsgClipBlobBegin && t <= MsgClipShown }
 
 // ClipFormat is one clipboard format. Built-in Windows formats are known by
 // number (ID); formats that programs register are known by Name, with ID 0,

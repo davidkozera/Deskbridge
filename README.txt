@@ -106,8 +106,11 @@ USING THE CLIENT
   - The tabs behind stay connected at two frames a second, without
     sound or video for motion, so they cost little and their pictures
     are current when you switch to them.
-  - Frames per second, picture quality and the tick boxes apply to all
-    connections.
+  - Frames per second, picture quality and the tick boxes belong to each
+    connection: the pane shows those of the tab in front, changing one
+    changes it for that connection only, and each saved connection
+    remembers its own. A connection saved before version 1.7.0 starts
+    with whatever the pane shows when you connect.
   - A tab whose label ends in "(connecting...)" is still connecting or
     is reconnecting; "(not connected)" means the attempt failed or
     another PC took that connection over. Click Connect to try again,
@@ -163,8 +166,12 @@ USING THE CLIENT
                                The file opens in Excel and can be
                                edited there; its columns are Name,
                                Computer, Port, Password, Resolution
-                               (such as 1920x1080) and Display (a
-                               number, or "all").
+                               (such as 1920x1080), Display (a number,
+                               or "all"), then the connection's own
+                               settings: Frames per second, Quality,
+                               and yes or no for Sound, Allow sleep,
+                               Copy and paste, Video for motion and
+                               Fast capture.
   Remote display               Which of the remote PC's displays to
                                show, or all of them side by side. Each
                                connection remembers its own. The list follows
@@ -287,6 +294,25 @@ COPY AND PASTE
   - On the Arm PC, copy and paste works while someone is signed in (not
     from the sign-in screen).
   - Untick "Share copy and paste" in the client to switch it off.
+
+  DRAGGING FILES ONTO THE REMOTE SCREEN
+  Drag files or folders from File Explorer on this PC and drop them on
+  the remote screen. The remote pointer follows as you drag. When you
+  let go, the files are offered to the remote PC the same way copied
+  files are; once it has them, the client clicks the spot where you
+  dropped them and presses Ctrl+V there, and Windows on the remote PC
+  shows its copy progress window.
+
+  - Drop on a folder window or the desktop and the files land there.
+    Dropping on a folder's icon puts them in the folder that is open,
+    not inside the icon's folder.
+  - The click is a real click on the remote PC, so drop on the window
+    you mean rather than on a button or a link.
+  - It needs "Share copy and paste" ticked, and it replaces what is on
+    the remote PC's clipboard.
+  - With a server older than 1.7.0 the files reach the remote PC's
+    clipboard but are not pasted for you: click where you want them and
+    press Ctrl+V.
   - With several connections open, copy and paste is shared with the
     tab in front. When you switch tabs, what is on this PC's clipboard
     goes to the PC you switched to, so text or a picture copied on one

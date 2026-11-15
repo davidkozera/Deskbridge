@@ -39,6 +39,8 @@ type computer struct {
 	res              resolution   // zero: leave the remote display as it is
 	display          int          // noPreference, -1 for all, or a display's index
 	modes            []resolution // what its display offered when last connected
+	opts             options      // its frame rate, quality and tick boxes
+	hasOpts          bool         // false for one saved before each connection kept its own
 }
 
 // target is everything needed to connect.
@@ -112,14 +114,18 @@ func currentProfile() int {
 	return findComputer(cleanName(getText(hName)))
 }
 
-// loadProfile shows a saved connection's display and resolution in the
-// pane, ready for connecting. With a tab open the lists are about that tab
-// instead, and the saved ones are taken up when the connection is made.
+// loadProfile shows a saved connection's display, resolution and settings
+// in the pane, ready for connecting. With a tab open the pane is about
+// that tab instead, and the saved ones are taken up when the connection is
+// made.
 func loadProfile(i int) {
 	if active != nil {
 		return
 	}
 	wantedDisplay, wantedRes = computers[i].display, computers[i].res
+	if computers[i].hasOpts {
+		showOptions(computers[i].opts)
+	}
 	showResolutions()
 }
 
@@ -221,8 +227,10 @@ func storeEntry(t target, remember bool, tb *tab) int {
 	switch {
 	case tb != nil:
 		c.res, c.display = tb.wantedRes, tb.wantedDisplay
+		c.opts, c.hasOpts = tb.opts, true
 	case active == nil:
-		c.res = wantedRes // what the resolution list shows
+		c.res = wantedRes // what the pane shows
+		c.opts, c.hasOpts = readOptions(), true
 	}
 	if i >= 0 {
 		computers[i] = c
@@ -314,7 +322,7 @@ func forgetComputer() {
 }
 
 // computerLines is the saved list in the form kept in the settings file:
-// name|host|port|password|resolution|display|resolutions offered.
+// name|host|port|password|resolution|display|resolutions offered|settings.
 func computerLines() []string {
 	var lines []string
 	for _, c := range computers {
@@ -322,8 +330,12 @@ func computerLines() []string {
 		for _, m := range c.modes {
 			modes = append(modes, m.String())
 		}
+		opts := ""
+		if c.hasOpts {
+			opts = c.opts.String()
+		}
 		lines = append(lines, "connection="+strings.Join([]string{c.name, c.host, c.port, hex.EncodeToString(c.password),
-			c.res.String(), strconv.Itoa(c.display), strings.Join(modes, ",")}, "|"))
+			c.res.String(), strconv.Itoa(c.display), strings.Join(modes, ","), opts}, "|"))
 	}
 	return lines
 }
@@ -353,6 +365,9 @@ func parseConnection(v string) {
 				c.modes = append(c.modes, r)
 			}
 		}
+	}
+	if len(parts) > 7 {
+		c.opts, c.hasOpts = parseOptions(parts[7])
 	}
 	computers = append(computers, c)
 }

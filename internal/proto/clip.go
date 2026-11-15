@@ -23,6 +23,7 @@ const (
 	MsgClipFetchData = 39 // id u32, index u32, offset u64, status u8, bytes
 	MsgClipFetchStop = 40 // id u32, index u32: the reader is done with this file
 	MsgClipState     = 41 // u8: used only between the service worker and its clipboard helper
+	MsgClipShown     = 42 // id u32: the list with this id is now on the receiving PC's clipboard, ready to paste
 )
 
 const (

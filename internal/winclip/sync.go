@@ -3,6 +3,7 @@
 package winclip
 
 import (
+	"encoding/binary"
 	"errors"
 	"runtime"
 	"strconv"
@@ -28,6 +29,11 @@ type Sender func(t byte, p []byte) error
 type Sync struct {
 	Enabled func() bool  // is sharing switched on right now?
 	Status  func(string) // optional: tell the person what happened
+	// Shown is called, if set, with the outcome of OfferFiles: ok when the
+	// other PC confirms the files are on its clipboard, not ok when they
+	// could not be listed here and so were never sent. It may run on any
+	// goroutine.
+	Shown func(id uint32, ok bool)
 
 	hwnd   uintptr
 	cur    atomic.Pointer[Peer]
@@ -261,6 +267,44 @@ func (s *Sync) streamGone(st *streamObject) {
 	}
 }
 
+// OfferFiles offers files to the other PC as though they had just been
+// copied here, without touching this PC's clipboard: they appear on the
+// other PC's clipboard and cross when something there pastes them. It is
+// what dropping files onto the remote screen does. It returns the id the
+// other PC confirms with (see Shown), or 0 if nothing is being shared with.
+// Safe to call from any goroutine.
+func (s *Sync) OfferFiles(files []string) uint32 {
+	p := s.cur.Load()
+	if p == nil || !s.Enabled() || len(files) == 0 {
+		return 0
+	}
+	s.mu.Lock()
+	s.remotePrint = nil
+	s.mu.Unlock()
+	gen := s.gen.Add(1)
+	go func() {
+		// Listing a large folder takes a moment.
+		entries, err := proto.PlanList(files)
+		if s.gen.Load() != gen || s.cur.Load() != p {
+			return // something was copied meanwhile, or the connection changed
+		}
+		if err != nil || len(entries) == 0 {
+			if errors.Is(err, proto.ErrClipTooBig) {
+				s.say("Those files cannot be sent to the other PC: more than " + strconv.Itoa(proto.ClipMaxFiles) + " items.")
+			} else {
+				s.say("Those files could not be read, so nothing was sent to the other PC.")
+			}
+			if s.Shown != nil {
+				s.Shown(gen, false)
+			}
+			return
+		}
+		s.server.Offer(gen, entries)
+		p.send(proto.MsgClipList, proto.EncodeList(gen, entries))
+	}()
+	return gen
+}
+
 // localChanged reacts to something being copied on this PC. Clipboard
 // thread only.
 func (s *Sync) localChanged() { s.announce(false) }
@@ -351,6 +395,11 @@ func (p *Peer) Remote(t byte, payload []byte) {
 			}
 		})
 
+	case proto.MsgClipShown:
+		if len(payload) >= 4 && s.Shown != nil {
+			s.Shown(binary.LittleEndian.Uint32(payload), true)
+		}
+
 	case proto.MsgClipList:
 		id, entries, err := proto.DecodeList(payload)
 		if err != nil {
@@ -378,6 +427,9 @@ func (p *Peer) Remote(t byte, payload []byte) {
 			if int32(hr) >= 0 {
 				s.current = d.ptr()
 				s.setSeq.Store(Sequence())
+				// Tell the sender the files can be pasted now. (A sender
+				// from before version 1.7.0 ignores this.)
+				go p.send(proto.MsgClipShown, binary.LittleEndian.AppendUint32(nil, id))
 			}
 			doRelease(d.ptr()) // the clipboard holds its own reference now
 		})

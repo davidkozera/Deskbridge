@@ -81,6 +81,21 @@ func formatName(f uintptr) string {
 // ReadAll returns the copied files if there are any; otherwise every
 // transferable format on the clipboard (text, pictures, rich text...).
 // Call it on the thread that owns hwnd.
+// droppedFiles lists the paths in a file-drop handle (an HDROP).
+func droppedFiles(h uintptr) (files []string) {
+	n, _, _ := pDragQueryFile.Call(h, 0xFFFFFFFF, 0, 0)
+	for i := uintptr(0); i < n && i < 10000; i++ {
+		l, _, _ := pDragQueryFile.Call(h, i, 0, 0)
+		if l == 0 || l > 32767 {
+			continue
+		}
+		buf := make([]uint16, l+1)
+		pDragQueryFile.Call(h, i, uintptr(unsafe.Pointer(&buf[0])), l+1)
+		files = append(files, syscall.UTF16ToString(buf))
+	}
+	return files
+}
+
 func ReadAll(hwnd uintptr) (formats []proto.ClipFormat, files []string) {
 	if !open(hwnd) {
 		return nil, nil
@@ -88,16 +103,7 @@ func ReadAll(hwnd uintptr) (formats []proto.ClipFormat, files []string) {
 	defer pCloseClipboard.Call()
 	if r, _, _ := pIsFormatAvail.Call(cfHDrop); r != 0 {
 		if h, _, _ := pGetClipboardData.Call(cfHDrop); h != 0 {
-			n, _, _ := pDragQueryFile.Call(h, 0xFFFFFFFF, 0, 0)
-			for i := uintptr(0); i < n && i < 10000; i++ {
-				l, _, _ := pDragQueryFile.Call(h, i, 0, 0)
-				if l == 0 || l > 32767 {
-					continue
-				}
-				buf := make([]uint16, l+1)
-				pDragQueryFile.Call(h, i, uintptr(unsafe.Pointer(&buf[0])), l+1)
-				files = append(files, syscall.UTF16ToString(buf))
-			}
+			files = droppedFiles(h)
 			if len(files) > 0 {
 				return nil, files
 			}

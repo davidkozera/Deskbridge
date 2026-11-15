@@ -128,6 +128,10 @@ func exportConnections() {
 	withPassword := 0
 	for _, c := range computers {
 		row := connfile.Connection{Name: c.name, Host: c.host, Port: c.port, Width: c.res.w, Height: c.res.h, Display: c.display}
+		if o := c.opts; c.hasOpts {
+			row.HasSettings, row.FPS, row.Quality = true, o.fps, o.quality
+			row.Sound, row.AllowSleep, row.CopyPaste, row.Video, row.FastCapture = o.audio, o.sleep, o.clip, o.video, o.fast
+		}
 		if pw := dpapi(pCryptUnprotectData, c.password); pw != nil {
 			row.Password = string(pw)
 			withPassword++
@@ -173,6 +177,11 @@ func importConnections() {
 		c := computer{name: row.Name, host: row.Host, port: row.Port, res: resolution{row.Width, row.Height}, display: row.Display}
 		if row.Password != "" {
 			c.password = dpapi(pCryptProtectData, []byte(row.Password))
+		}
+		if row.HasSettings {
+			c.hasOpts = true
+			c.opts = options{fps: row.FPS, quality: row.Quality, audio: row.Sound, sleep: row.AllowSleep,
+				clip: row.CopyPaste, video: row.Video, fast: row.FastCapture}
 		}
 		if i := findComputer(c.name); i >= 0 {
 			if strings.EqualFold(computers[i].host, c.host) {

@@ -444,6 +444,7 @@ func main() {
 	hTabs, _, _ = pCreateWindowEx.Call(0, uintptr(unsafe.Pointer(tabsClass)), 0, wsChild, 0, 0, 10, 10, hMain, 0, inst, 0)
 	loadSettings()
 	startClipboard()
+	setupFileDrop()
 	pSetTimer.Call(hMain, timerFrameRate, 1000, 0) // drives the frame-rate readout
 	go watchForUpdates()
 	go func() { // finding decoders can take a moment; do not hold up the window
@@ -734,28 +735,28 @@ var (
 
 func setStatus(s string) { setText(hStatus, s) }
 
-// settingsPayload is the pane's choices as sent to a server. A connection
-// that is not in front is asked for much less: a couple of frames a second
-// to keep its picture current, no sound and no video.
-func settingsPayload(front bool) []byte {
-	b := []byte{byte(comboValue(hFPS, fpsChoices)), byte(comboValue(hQuality, qualityChoices)), 0, 0, 0, 0, 0, 0}
+// settingsPayload is a connection's settings as sent to its server. A
+// connection that is not in front is asked for much less: a couple of
+// frames a second to keep its picture current, no sound and no video.
+func settingsPayload(o options, front bool) []byte {
+	b := []byte{byte(o.fps), byte(o.quality), 0, 0, 0, 0, 0, 0}
 	if !front {
 		b[0] = backgroundFPS
 	}
-	if checked(hAudio) && front {
+	if o.audio && front {
 		b[2] = 1
 	}
-	if checked(hSleep) {
+	if o.sleep {
 		b[3] = 1
 	}
-	if checked(hClip) {
+	if o.clip {
 		b[4] = 1
 	}
-	if checked(hVideo) && front {
+	if o.video && front {
 		b[5] = 1
 	}
 	b[6] = byte(videoCaps.Load())
-	if checked(hFast) {
+	if o.fast {
 		b[7] = 1
 	}
 	return b
@@ -763,17 +764,33 @@ func settingsPayload(front bool) []byte {
 
 const backgroundFPS = 2
 
-// applySettings pushes the pane's choices to every connected server and
-// remembers them.
+// applySettings runs when one of the pane's settings is changed. The
+// change belongs to the tab in front (and is sent to its server) and to
+// that connection's saved entry; with no tab open, to the saved connection
+// named in the boxes.
 func applySettings() {
-	audioOn.Store(checked(hAudio))
-	clipOn.Store(checked(hClip))
+	o := readOptions()
+	audioOn.Store(o.audio)
+	clipOn.Store(o.clip)
+	if active != nil {
+		active.opts = o
+		if active.l != nil {
+			sendSettings(active.l)
+		}
+	}
+	if i := currentProfile(); i >= 0 {
+		computers[i].opts, computers[i].hasOpts = o, true
+	}
+	saveSettings()
+}
+
+// resendSettings sends every connected server its settings again.
+func resendSettings() {
 	for _, tb := range tabs {
 		if tb.l != nil {
 			sendSettings(tb.l)
 		}
 	}
-	saveSettings()
 }
 
 // ---------- saved settings ----------
@@ -1024,8 +1041,8 @@ func (v *videoSink) fail(err error) {
 	v.failed = true
 	v.close()
 	s := "Video for motion was switched off because decoding failed (" + err.Error() + "). The picture continues the standard way."
-	statusText.Store(&s)
-	pPostMessage.Call(hMain, wmVideoFailed, 0, 0)
+	v.l.status.Store(&s)
+	pPostMessage.Call(hMain, wmVideoFailed, v.l.id, 0)
 }
 
 func (v *videoSink) handle(p []byte) {
@@ -1116,7 +1133,7 @@ func postStatus(s string) {
 func startClipboard() {
 	// Earlier versions kept pasted files here; nothing does any more.
 	os.RemoveAll(filepath.Join(os.TempDir(), "Deskbridge", "Clipboard"))
-	c := &winclip.Sync{Enabled: clipOn.Load, Status: postStatus}
+	c := &winclip.Sync{Enabled: clipOn.Load, Status: postStatus, Shown: dropShown}
 	if c.Start() {
 		clip = c
 	}
@@ -1293,6 +1310,9 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 	case wmSwitchTab:
 		stepTab(wParam == 1)
 		return 0
+	case wmDropShown:
+		dropConfirmed(uint32(wParam), lParam == 1)
+		return 0
 	}
 	switch message {
 	case wmSize:
@@ -1381,20 +1401,29 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 		onConnectDone()
 		return 0
 	case wmVideoCaps:
-		applySettings() // tell the servers what we can decode
+		resendSettings() // tell the servers what we can decode
 		if cur.Load() != nil {
 			if note := videoNote(); note != "" {
 				setStatus(strings.TrimSpace(note))
 			}
 		}
 		return 0
-	case wmVideoFailed:
-		if checked(hVideo) {
-			setChecked(hVideo, false)
-			applySettings()
-		}
-		if s := statusText.Swap(nil); s != nil {
-			setStatus(*s)
+	case wmVideoFailed: // wParam: the connection whose decoder gave up
+		if tb := tabOfLink(wParam); tb != nil {
+			if tb.opts.video {
+				tb.opts.video = false
+				if tb == active {
+					setChecked(hVideo, false)
+				}
+				if i := findComputer(tb.target.name); i >= 0 && computers[i].hasOpts {
+					computers[i].opts.video = false
+				}
+				sendSettings(tb.l)
+				saveSettings()
+			}
+			if s := tb.l.status.Swap(nil); s != nil {
+				setTabStatus(tb, *s)
+			}
 		}
 		return 0
 	case wmStatus:
@@ -1420,6 +1449,10 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 	case 0x0113: // WM_TIMER
 		if wParam >= timerReconnectBase {
 			reconnectTimer(wParam)
+			return 0
+		}
+		if wParam == timerDropHint || wParam == timerDropPaste {
+			dropTimer(wParam)
 			return 0
 		}
 		// Otherwise the once-a-second tick behind the frame-rate readout.
@@ -1497,7 +1530,11 @@ func destRect() (dx, dy, dw, dh, rw, rh int) {
 }
 
 func remotePoint(lParam uintptr) (x, y int, ok bool) {
-	cx, cy := int(int16(lParam)), int(int16(lParam>>16))
+	return remoteAt(int(int16(lParam)), int(int16(lParam>>16)))
+}
+
+// remoteAt turns a position in the view into one on the remote screen.
+func remoteAt(cx, cy int) (x, y int, ok bool) {
 	dx, dy, dw, dh, rw, rh := destRect()
 	if dw == 0 || dh == 0 {
 		return 0, 0, false

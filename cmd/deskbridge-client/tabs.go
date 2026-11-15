@@ -60,6 +60,8 @@ type tab struct {
 	viewNote          string // shown in place of the remote screen while there is none
 	status            string // this tab's text for the pane
 
+	opts options // its frame rate, quality and tick boxes
+
 	wantedDisplay    int        // noPreference, -1 for all, or a display's index
 	displayRequested bool       // it has been asked for on this connection
 	wantedRes        resolution // zero: leave the remote display as it is
@@ -143,9 +145,13 @@ func sendTo(l *link, t byte, payload []byte) {
 	}
 }
 
-// sendSettings tells a server the pane's choices: in full for the
+// sendSettings tells a server its connection's settings: in full for the
 // connection in front, pared down for the ones behind it.
-func sendSettings(l *link) { sendTo(l, proto.MsgSettings, settingsPayload(cur.Load() == l)) }
+func sendSettings(l *link) {
+	if tb := tabOfLink(l.id); tb != nil {
+		sendTo(l, proto.MsgSettings, settingsPayload(tb.opts, cur.Load() == l))
+	}
+}
 
 func setTabStatus(tb *tab, s string) {
 	tb.status = s
@@ -185,16 +191,21 @@ func activate(tb *tab, byPerson bool) {
 			l.peer.Activate(old != nil)
 		}
 	}
-	switch {
-	case tb == nil:
-		// Back to choosing a connection: the lists show the one named in
+	if tb == nil {
+		// Back to choosing a connection: the pane shows the one named in
 		// the boxes.
 		wantedDisplay, wantedRes = noPreference, resolution{}
 		if i := findComputer(cleanName(getText(hName))); i >= 0 {
 			wantedDisplay, wantedRes = computers[i].display, computers[i].res
+			if computers[i].hasOpts {
+				showOptions(computers[i].opts)
+			}
 		}
-	case byPerson:
-		showInPane(tb)
+	} else {
+		showOptions(tb.opts) // the pane's settings are this connection's
+		if byPerson {
+			showInPane(tb)
+		}
 	}
 	refreshPane()
 }
@@ -373,6 +384,9 @@ func startConnect() {
 		}
 		// A stopped tab of this name: try again with what is typed now.
 		tb.target, tb.remember = t, checked(hRemember)
+		if tb == active {
+			tb.opts = readOptions()
+		}
 		activate(tb, false)
 		connectTo(tb, false)
 		return
@@ -393,6 +407,15 @@ func startConnect() {
 	case reuse:
 		shown = active.wantedRes
 	}
+	// Its settings: what the pane shows, except that with another tab in
+	// front the pane shows that tab's, so a saved connection then starts
+	// with its own.
+	opts := readOptions()
+	if active != nil && !reuse {
+		if i := findComputer(t.name); i >= 0 && computers[i].hasOpts {
+			opts = computers[i].opts
+		}
+	}
 	var tb *tab
 	if reuse {
 		tb = active
@@ -400,6 +423,7 @@ func startConnect() {
 	} else {
 		tb = newTab(t)
 	}
+	tb.opts = opts
 	tb.remember = checked(hRemember)
 	tb.wantedDisplay, tb.wantedRes = noPreference, shown
 	if i := findComputer(t.name); i >= 0 {
@@ -468,6 +492,7 @@ func connectAtLaunch() {
 	t := typedTarget()
 	tb := newTab(t)
 	tb.remember = checked(hRemember)
+	tb.opts = readOptions() // loaded from the saved connection at start
 	if i := findComputer(t.name); i >= 0 {
 		tb.wantedDisplay, tb.wantedRes = computers[i].display, computers[i].res
 	}
