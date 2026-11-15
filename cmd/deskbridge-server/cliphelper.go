@@ -76,7 +76,7 @@ func startClipRelay() {
 					old.Close()
 				}
 				log.Print("clipboard helper connected")
-				clipRelayState(clipEnabled())
+				clipRelayResume()
 				for {
 					t, p, err := c.Read()
 					if err != nil {
@@ -87,10 +87,8 @@ func startClipRelay() {
 					if !proto.IsClipMsg(t) || t == proto.MsgClipState {
 						continue
 					}
-					activeMu.Lock()
-					s := active
-					activeMu.Unlock()
-					if s != nil && !s.closed() && s.clipOn.Load() {
+					// Copy and paste is shared with the client in control.
+					if s := control.Load(); s != nil && !s.closed() && s.clipOn.Load() {
 						s.c.Send(t, true, p)
 					}
 				}
@@ -123,14 +121,26 @@ func startClipRelay() {
 	}()
 }
 
+// What the helper can be told to do.
+const (
+	clipOff = 0 // stop sharing
+	clipOn  = 1 // share from now on
+)
+
 // clipRelayState tells the helper whether to share.
-func clipRelayState(on bool) {
+func clipRelayState(state byte) {
 	if h := helper.Load(); h != nil {
-		b := byte(0)
-		if on {
-			b = 1
-		}
-		h.Send(proto.MsgClipState, true, []byte{b})
+		h.Send(proto.MsgClipState, true, []byte{state})
+	}
+}
+
+// clipRelayResume puts the helper in the state the client in control
+// calls for: after the helper (re)starts, or that client's setting changes.
+func clipRelayResume() {
+	if clipEnabled() {
+		clipRelayState(clipOn)
+	} else {
+		clipRelayState(clipOff)
 	}
 }
 
@@ -171,12 +181,15 @@ func spawnHelper(port int, token string) (syscall.Handle, error) {
 type relayPeer struct{ s *session }
 
 func (r relayPeer) Remote(t byte, p []byte) {
-	if h := helper.Load(); h != nil && r.s.clipOn.Load() && t != proto.MsgClipState {
+	// Only the client in control shares copy and paste.
+	if h := helper.Load(); h != nil && inControl(r.s) && r.s.clipOn.Load() && t != proto.MsgClipState {
 		h.Send(t, true, p)
 	}
 }
 
-func (r relayPeer) Close() { clipRelayState(clipEnabled()) }
+// Close has nothing to undo: when the client in control goes, clipControl
+// moves sharing on or switches it off.
+func (r relayPeer) Close() {}
 
 // ---------- helper side ----------
 
@@ -212,7 +225,7 @@ func runClipHelper(args []string) {
 		}
 		switch {
 		case t == proto.MsgClipState:
-			on := len(p) > 0 && p[0] == 1
+			on := len(p) > 0 && p[0] == clipOn
 			enabled.Store(on)
 			if on && peer == nil {
 				peer = sync.Connect(send)

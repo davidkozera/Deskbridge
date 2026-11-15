@@ -114,7 +114,10 @@ func modesArrived(tb *tab) {
 	// one in front too.
 	if len(m.list) > 0 && !tb.resRequested && !displayPending(tb) {
 		tb.resRequested = true
-		if r := tb.wantedRes; r.w != 0 && r != m.current && hasResolution(m.list, r) {
+		// Not while another PC is in control: the resolution is the remote
+		// PC's own, and changing it would pull the screen out from under
+		// whoever is working on it.
+		if r := tb.wantedRes; tb.l.inControl.Load() && r.w != 0 && r != m.current && hasResolution(m.list, r) {
 			sendTo(tb.l, proto.MsgSetResolution, resolutionPayload(r))
 		}
 	}

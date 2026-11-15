@@ -32,6 +32,14 @@ const (
 	timerDropPaste = 4 // the click has had time to take effect: press Ctrl+V
 )
 
+// heldDrop is a drop waiting for this PC to be given control. Touched only
+// on the UI thread.
+var heldDrop struct {
+	link   uintptr
+	sx, sy int
+	files  []string
+}
+
 // pendingDrop is the drop being carried out. Touched only on the UI thread.
 var pendingDrop struct {
 	id    uint32  // 0: none
@@ -77,6 +85,14 @@ func filesDropped(sx, sy int, files []string) {
 	l := cur.Load()
 	x, y, ok := viewPoint(sx, sy)
 	if l == nil || !ok {
+		return
+	}
+	if !l.inControl.Load() && clip != nil && clipOn.Load() {
+		// Another PC is in control. Dropping files is as deliberate as a
+		// click: take control, and send them once it is ours.
+		heldDrop.link, heldDrop.sx, heldDrop.sy, heldDrop.files = l.id, sx, sy, files
+		queue(proto.MsgTakeControl, nil)
+		setStatus("Taking control of the remote PC to drop " + items(len(files)) + " there...")
 		return
 	}
 	id := uint32(0)

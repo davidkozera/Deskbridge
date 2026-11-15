@@ -27,6 +27,8 @@ const (
 	MsgUpdateResult = 9  // ok u8, then text: the server's answer to an update it was sent
 	MsgMonitors     = 10 // selected i8 (-1 = all), count u8, then per display: x i32, y i32, w u32, h u32, flags u8 (1 = main)
 	MsgPong         = 11 // the answer to MsgPing
+	MsgPointer      = 13 // x u16, y u16, visible u8: where the remote pointer is on the picture, for a client that is not the one moving it
+	MsgControl      = 14 // u8 (1: this client is in control of the mouse and keyboard; 0: it is not), then the name of the PC that is
 	MsgModes        = 12 // current w u16, h u16, count u8, then that many (w u16, h u16): resolutions the shown display supports
 )
 
@@ -44,6 +46,7 @@ const (
 	MsgUpdateEnd     = 25
 	MsgSelectMonitor = 26 // i8: which display to show, -1 for all of them
 	MsgAction        = 27 // u8: one of the Action values
+	MsgTakeControl   = 43 // this client wants the mouse and keyboard (clicking or typing takes them too)
 	MsgPing          = 28 // "are you there?", sent every couple of seconds
 	MsgSetResolution = 29 // w u16, h u16: change the shown display's resolution; 0,0 puts it back
 )

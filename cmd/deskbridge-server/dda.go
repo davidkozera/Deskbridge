@@ -15,11 +15,19 @@ package main
 // attaches itself to whichever desktop is showing; when the desktop or the
 // display mode changes, Windows reports the duplication lost and the caller
 // simply makes a new one.
+//
+// Windows lets a program duplicate a display only once. With several
+// clients connected, each with a capturer of its own, the duplication of a
+// display is therefore shared: see acquireDDA. While more than one client
+// is watching a display, its duplication keeps the latest picture so that
+// each of them gets every change, whichever of them happened to fetch it.
 
 import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 )
@@ -119,13 +127,62 @@ type mappedSubresource struct {
 type dda struct {
 	jobs chan func()
 
+	users atomic.Int32 // how many capturers share it
+	dead  atomic.Bool  // Windows reported it lost: everyone must let go of it
+
 	// Used only on the duplication's own thread.
 	desktop            uintptr
 	device, context    uintptr
 	dupl, staging      uintptr
 	stagingW, stagingH uint32
 	primed             bool
-	left, top          int32 // which monitor
+	left, top          int32  // which monitor
+	seq                uint64 // counts the pictures delivered
+	shared             []byte // the latest picture, while several capturers are watching
+	sharedOK           bool   // shared holds picture number seq
+}
+
+// The duplications in use, by the corner of the monitor each is of.
+var (
+	ddaMu   sync.Mutex
+	ddaPool = map[[2]int]*dda{}
+)
+
+// acquireDDA returns the duplication of the monitor whose top-left corner
+// is at (left, top), starting one if none is running. Every capturer that
+// acquires one must drop it when done.
+func acquireDDA(left, top int) (*dda, error) {
+	ddaMu.Lock()
+	defer ddaMu.Unlock()
+	key := [2]int{left, top}
+	if d := ddaPool[key]; d != nil && !d.dead.Load() {
+		// A capturer joining one already running gets its first picture
+		// the next time the display changes; until then it captures the
+		// standard way (see capturer.grab).
+		d.users.Add(1)
+		return d, nil
+	}
+	d, err := newDDA(left, top)
+	if err != nil {
+		return nil, err
+	}
+	d.users.Store(1)
+	ddaPool[key] = d
+	return d, nil
+}
+
+// drop lets go of a duplication; the last capturer to do so ends it.
+func (d *dda) drop() {
+	ddaMu.Lock()
+	defer ddaMu.Unlock()
+	if d.users.Add(-1) > 0 {
+		return
+	}
+	key := [2]int{int(d.left), int(d.top)}
+	if ddaPool[key] == d {
+		delete(ddaPool, key)
+	}
+	close(d.jobs)
 }
 
 // newDDA starts duplicating the monitor whose top-left corner is at
@@ -147,8 +204,6 @@ func newDDA(left, top int) (*dda, error) {
 	}
 	return d, nil
 }
-
-func (d *dda) close() { close(d.jobs) }
 
 func (d *dda) init() error {
 	if pCreateDXGIFactory1.Find() != nil || pD3D11CreateDevice.Find() != nil {
@@ -237,15 +292,98 @@ func (d *dda) release() {
 
 // grab waits up to waitMs for the monitor to change and, if it did, copies
 // its new w×h picture into pix at (offX, offY). pix is BGRA, top row first,
-// with rows stride pixels long; it may be larger than one monitor.
-func (d *dda) grab(pix []byte, stride, offX, offY, w, h, waitMs int) (result int) {
+// with rows stride pixels long; it may be larger than one monitor. seen is
+// the caller's own note of which picture it last received, starting at 0.
+func (d *dda) grab(seen *uint64, pix []byte, stride, offX, offY, w, h, waitMs int) (result int) {
+	if d.dead.Load() {
+		return ddaLost
+	}
 	done := make(chan struct{})
-	d.jobs <- func() { result = d.grabOnThread(pix, stride, offX, offY, w, h, waitMs); close(done) }
+	d.jobs <- func() { result = d.grabShared(seen, pix, stride, offX, offY, w, h, waitMs); close(done) }
 	<-done
 	return
 }
 
-func (d *dda) grabOnThread(pix []byte, stride, offX, offY, w, h, waitMs int) int {
+// grabShared serves one capturer, allowing for others sharing the
+// duplication. Duplication thread only.
+func (d *dda) grabShared(seen *uint64, pix []byte, stride, offX, offY, w, h, waitMs int) int {
+	if d.dead.Load() {
+		return ddaLost
+	}
+	// Once lost it is no use to anyone. Let go of the display at once, so
+	// that a fresh duplication can be made even while other capturers
+	// still hold this one.
+	fail := func() int {
+		d.dead.Store(true)
+		release(d.dupl)
+		d.dupl = 0
+		return ddaLost
+	}
+	several := d.users.Load() > 1
+	// A picture another capturer fetched that this one has not had yet.
+	if d.sharedOK && *seen != d.seq {
+		if len(d.shared) != w*h*4 || !copyPicture(pix, stride, offX, offY, d.shared, w, h) {
+			return fail()
+		}
+		*seen = d.seq
+		if !several {
+			d.shared, d.sharedOK = nil, false // back to one watcher: no need to keep it
+		}
+		return ddaFrame
+	}
+	if !several {
+		// The only watcher: straight into its own buffer.
+		d.shared, d.sharedOK = nil, false
+		r := d.fetch(pix, stride, offX, offY, w, h, waitMs)
+		switch r {
+		case ddaFrame:
+			d.seq++
+			*seen = d.seq
+		case ddaLost:
+			return fail()
+		}
+		return r
+	}
+	// Several watchers: into the shared picture, from which each takes it.
+	if len(d.shared) != w*h*4 {
+		d.shared, d.sharedOK = make([]byte, w*h*4), false
+	}
+	switch d.fetch(d.shared, w, 0, 0, w, h, waitMs) {
+	case ddaFrame:
+		d.seq++
+		d.sharedOK = true
+		if !copyPicture(pix, stride, offX, offY, d.shared, w, h) {
+			return fail()
+		}
+		*seen = d.seq
+		return ddaFrame
+	case ddaSame:
+		return ddaSame
+	}
+	return fail()
+}
+
+// copyPicture copies a w×h picture into pix at (offX, offY), where pix has
+// rows stride pixels long. It reports false if it would not fit.
+func copyPicture(pix []byte, stride, offX, offY int, src []byte, w, h int) bool {
+	row := w * 4
+	if offX < 0 || offY < 0 || offX+w > stride || len(pix) < ((offY+h-1)*stride+offX+w)*4 || len(src) < row*h {
+		return false
+	}
+	if stride == w && offX == 0 {
+		copy(pix[offY*row:], src[:row*h])
+		return true
+	}
+	for y := 0; y < h; y++ {
+		o := ((offY+y)*stride + offX) * 4
+		copy(pix[o:o+row], src[y*row:(y+1)*row])
+	}
+	return true
+}
+
+// fetch asks Windows for the next picture and copies it into pix.
+// Duplication thread only.
+func (d *dda) fetch(pix []byte, stride, offX, offY, w, h, waitMs int) int {
 	var info frameInfo
 	var resource uintptr
 	hr := hcall(d.dupl, duplAcquireNextFrame, uintptr(waitMs), uintptr(unsafe.Pointer(&info)), uintptr(unsafe.Pointer(&resource)))

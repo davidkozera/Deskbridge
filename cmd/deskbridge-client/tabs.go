@@ -59,6 +59,7 @@ type tab struct {
 	restoreFullscreen bool   // go back to full screen once reconnected
 	viewNote          string // shown in place of the remote screen while there is none
 	status            string // this tab's text for the pane
+	watching          bool   // another PC was in control when we last heard
 
 	opts options // its frame rate, quality and tick boxes
 
@@ -111,8 +112,8 @@ func tabNamed(name string) *tab {
 }
 
 // tabFor finds the tab already open for a connection: one of the same
-// name, or one to the same PC (which serves one client at a time, so a
-// second tab would only take the first one's place).
+// name, or one to the same PC (a second tab to it would only show the same
+// screen twice).
 func tabFor(t target) *tab {
 	if tb := tabNamed(t.name); tb != nil {
 		return tb
@@ -234,6 +235,7 @@ func refreshPane() {
 	}
 	pEnableWindow.Call(hSend, connected)
 	pEnableWindow.Call(hFullscreen, connected)
+	showTakeControl()
 	showDisplays()
 	showResolutions()
 	refreshConnectButton()
@@ -374,7 +376,7 @@ func startConnect() {
 			sameName := strings.EqualFold(tb.target.name, t.name)
 			activate(tb, !sameName)
 			if !sameName {
-				setStatus("That PC is already open in the tab \"" + tb.target.name + "\". A PC serves one connection at a time: close that tab first to connect to it with other settings.")
+				setStatus("That PC is already open in the tab \"" + tb.target.name + "\". Close that tab first to connect to it with other settings.")
 			}
 			refreshConnectButton()
 			if tb.l != nil && sameName {
@@ -556,6 +558,7 @@ func connectFinished(res *connectResult) {
 	tb.reconnecting, tb.attempt, tb.viewNote, tb.restoreFullscreen = false, 0, "", false
 	tb.everConnected = true
 	tb.displayRequested, tb.resRequested = false, false
+	tb.watching = false
 	tb.l = l
 	if tb == active {
 		cur.Store(l)
@@ -607,8 +610,8 @@ func onDisconnected(id uintptr) {
 	}
 	if l.replaced.Load() {
 		// Reconnecting would only start a tug of war.
-		tb.viewNote = "Another PC took over the connection to " + tb.target.name
-		tb.status = "Disconnected: another PC connected to " + tb.target.name + " and took over.\r\n\r\nClick Connect to take it back."
+		tb.viewNote = tb.target.name + " dropped this connection to make room for another PC"
+		tb.status = "Disconnected: " + tb.target.name + " dropped this connection to make room for another PC.\r\n\r\nClick Connect to connect again."
 		if tb == active {
 			openPane()
 		}
@@ -759,6 +762,9 @@ func paintTabs(h uintptr) {
 		label, ink := tb.target.name, uintptr(18)
 		switch {
 		case tb.l != nil:
+			if !tb.l.inControl.Load() {
+				label += "  (watching)"
+			}
 		case tb.stopped():
 			label, ink = label+"  (not connected)", 17
 		default:

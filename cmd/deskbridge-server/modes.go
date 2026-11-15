@@ -28,8 +28,6 @@ var (
 	pEnumDisplaySettings   = user32.NewProc("EnumDisplaySettingsW")
 	pChangeDisplaySettings = user32.NewProc("ChangeDisplaySettingsExW")
 
-	shownDevice atomic.Pointer[string] // the display being shown; "" for all displays
-
 	changedMu      sync.Mutex
 	changedDevices = map[string]bool{} // displays whose resolution we changed
 	restoreTurn    atomic.Int64        // counts disconnections; only the latest one's timer acts
@@ -119,7 +117,7 @@ func describeModes(device string, w, h int) []byte {
 // setting for 0×0, and tells the client if that was not possible.
 func changeResolution(s *session, w, h int) {
 	runtime.LockOSThread() // a fresh thread, on the normal desktop
-	dev := shownDevice.Load()
+	dev := s.device.Load()
 	if dev == nil || *dev == "" {
 		tell(s, "The resolution can only be changed while a single display is shown.")
 		return
@@ -178,10 +176,7 @@ func restoreResolutionsLater() {
 	turn := restoreTurn.Add(1)
 	go func() {
 		time.Sleep(time.Minute)
-		activeMu.Lock()
-		busy := active != nil && !active.closed()
-		activeMu.Unlock()
-		if busy || restoreTurn.Load() != turn {
+		if connected() || restoreTurn.Load() != turn {
 			return
 		}
 		runtime.LockOSThread()

@@ -158,6 +158,20 @@ func (p *Peer) Activate(announce bool) {
 	}
 }
 
+// Announce sends what is on this PC's clipboard right now to this
+// connection, as if it had just been copied, if this is the connection
+// being shared with. Safe to call from any goroutine.
+func (p *Peer) Announce() {
+	s := p.s
+	if s.cur.Load() != p {
+		return
+	}
+	s.mu.Lock()
+	s.remotePrint = nil
+	s.mu.Unlock()
+	s.onThread(func() { s.announce(true) })
+}
+
 // Deactivate stops sharing with this connection, if it is the one being
 // shared with: transfers in progress fail, and files from the other PC
 // that can no longer be fetched leave the clipboard. Safe to call from any

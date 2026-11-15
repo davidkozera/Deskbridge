@@ -85,6 +85,7 @@ type capturer struct {
 
 	// Fast capture: one duplication per display in parts.
 	dups     []*dda
+	seen     []uint64      // which picture each last gave us (see dda.grab)
 	primed   []bool        // which of them have delivered a first picture
 	live     bool          // pix is wholly from them, so "nothing changed" can be trusted
 	fast     bool          // the last picture came from fast capture
@@ -95,9 +96,9 @@ type capturer struct {
 
 func (c *capturer) dropDups() {
 	for _, d := range c.dups {
-		d.close()
+		d.drop()
 	}
-	c.dups, c.primed, c.live = nil, nil, false
+	c.dups, c.seen, c.primed, c.live = nil, nil, nil, false
 }
 
 func (c *capturer) free() {
@@ -211,14 +212,14 @@ func (c *capturer) grab(fast bool, waitMs int) (same, ok bool) {
 		var err error
 		for _, m := range c.parts {
 			var d *dda
-			if d, err = newDDA(m.x, m.y); err != nil {
+			if d, err = acquireDDA(m.x, m.y); err != nil {
 				break
 			}
 			ds = append(ds, d)
 		}
 		if err != nil {
 			for _, d := range ds {
-				d.close()
+				d.drop()
 			}
 			c.dupDelay = min(max(c.dupDelay*2, time.Second), time.Minute)
 			c.dupRetry = now.Add(c.dupDelay)
@@ -227,7 +228,7 @@ func (c *capturer) grab(fast bool, waitMs int) (same, ok bool) {
 				log.Printf("capture: fast capture unavailable, using the standard method: %v", err)
 			}
 		} else {
-			c.dups, c.primed = ds, make([]bool, len(ds))
+			c.dups, c.seen, c.primed = ds, make([]uint64, len(ds)), make([]bool, len(ds))
 			if c.dupNote != "fast" {
 				c.dupNote = "fast"
 				log.Print("capture: using fast capture (Desktop Duplication)")
@@ -247,7 +248,7 @@ func (c *capturer) grab(fast bool, waitMs int) (same, ok bool) {
 			if !c.primed[i] {
 				wait = max(wait, 100)
 			}
-			switch d.grab(c.pix, c.w, m.x-c.x, m.y-c.y, m.w, m.h, wait) {
+			switch d.grab(&c.seen[i], c.pix, c.w, m.x-c.x, m.y-c.y, m.w, m.h, wait) {
 			case ddaFrame:
 				frame, c.primed[i] = true, true
 			case ddaSame:

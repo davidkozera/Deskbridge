@@ -97,6 +97,21 @@ type session struct {
 	update      updateReceiver // used only by the input goroutine
 	done        chan struct{}
 	once        sync.Once
+
+	remote string   // the client's address, for messages
+	peer   clipPeer // its side of copy and paste
+
+	// The part of the desktop this client is shown (one display, or all
+	// of them), in desktop coordinates. Its mouse positions are relative
+	// to it.
+	regionX, regionY, regionW, regionH atomic.Int32
+	device                             atomic.Pointer[string] // the display it is shown; "" for all displays
+
+	// What it is holding down, so it can be let go if control moves on.
+	heldMu       sync.Mutex
+	heldKeys     map[uint32]keybdInput
+	heldButtons  uint32
+	lastX, lastY int
 }
 
 func (s *session) close() {
@@ -113,9 +128,6 @@ func (s *session) closed() bool {
 }
 
 var (
-	activeMu sync.Mutex
-	active   *session
-
 	// allowSleep starts from the -allowsleep flag; a client can change it,
 	// and the choice then holds until the server restarts.
 	allowSleep atomic.Bool
@@ -211,11 +223,9 @@ func powerLoop() {
 		want := uintptr(0x80000000) // ES_CONTINUOUS alone: no requirements
 		if !allowSleep.Load() {
 			want |= 0x1 // ES_SYSTEM_REQUIRED
-			activeMu.Lock()
-			if active != nil && !active.closed() {
+			if connected() {
 				want |= 0x2 // ES_DISPLAY_REQUIRED
 			}
-			activeMu.Unlock()
 		}
 		if want != last {
 			pSetThreadExecutionState.Call(want)
@@ -289,31 +299,26 @@ func serve(nc net.Conn, cfg *tls.Config, key []byte) {
 		serveMaintenance(tc, remote)
 		return
 	}
-	s := &session{c: proto.NewConn(tc), done: make(chan struct{})}
+	s := &session{c: proto.NewConn(tc), done: make(chan struct{}), remote: hostOf(remote)}
 	s.fps.Store(int32(*flagFPS))
 	s.quality.Store(int32(*flagQuality))
 	s.audioOn.Store(true)
 	s.clipOn.Store(true)
 	s.fastCapture.Store(true)
-	activeMu.Lock()
-	if active != nil {
-		// Tell the client it was replaced, so it does not reconnect and
-		// start a tug of war with the newcomer.
-		active.c.Send(proto.MsgNotice, true, []byte{proto.NoticeReplaced, '.'})
-		active.close()
-	}
-	active = s
-	activeMu.Unlock()
+	s.peer = clipAttach(s)
+	// It joins whoever is connected already (see control.go) and is told
+	// whether it is in control before anything else is sent.
+	addSession(s)
 	log.Printf("%s: connected", remote)
 
 	go videoLoop(s)
 	if !*flagNoAudio {
 		go audioLoop(s)
 	}
-	peer := clipAttach(s)
-	inputLoop(s, peer)
+	inputLoop(s, s.peer)
 	s.close()
-	peer.Close()
+	s.peer.Close()
+	removeSession(s)
 	restoreResolutionsLater()
 	log.Printf("%s: disconnected", remote)
 }
@@ -362,11 +367,10 @@ type noClip struct{}
 func (noClip) Remote(byte, []byte) {}
 func (noClip) Close()              {}
 
-// clipEnabled reports whether a client is connected with sharing on.
+// clipEnabled reports whether the client in control has sharing on.
 func clipEnabled() bool {
-	activeMu.Lock()
-	defer activeMu.Unlock()
-	return active != nil && !active.closed() && active.clipOn.Load()
+	s := control.Load()
+	return s != nil && !s.closed() && s.clipOn.Load()
 }
 
 func startClipboard() {
@@ -386,15 +390,14 @@ func startClipboard() {
 	clip = c
 }
 
-// clipAttach connects a new session to the clipboard.
+// clipAttach makes a new session's side of copy and paste. Sharing is
+// with one client at a time, the one in control: see clipControl.
 func clipAttach(s *session) clipPeer {
 	switch {
 	case workerMode:
-		clipRelayState(false) // start the helper from a clean slate
-		clipRelayState(clipEnabled())
 		return relayPeer{s}
 	case clip != nil:
-		return clip.Connect(func(t byte, p []byte) error { return s.c.Send(t, true, p) })
+		return clip.NewPeer(func(t byte, p []byte) error { return s.c.Send(t, true, p) })
 	}
 	return noClip{}
 }
@@ -488,12 +491,10 @@ const (
 	mouseVirtualDesk = 0x4000 // positions span every display, not just the main one
 )
 
-// The part of the desktop being shown (one display, or all of them), in
-// desktop coordinates. Mouse positions from the client are relative to it.
-var regionX, regionY, regionW, regionH atomic.Int32
-
-func sendMouse(x, y int, flags, data uint32) {
-	rw, rh := int(regionW.Load()), int(regionH.Load())
+// sendMouse moves the pointer to (x, y) on the part of the desktop a client
+// is shown, with the given button or wheel event.
+func sendMouse(s *session, x, y int, flags, data uint32) {
+	rw, rh := int(s.regionW.Load()), int(s.regionH.Load())
 	// The whole desktop, across every display: positions are given as
 	// fractions of it. Its corner is negative when a display sits left of or
 	// above the main one.
@@ -502,8 +503,8 @@ func sendMouse(x, y int, flags, data uint32) {
 	if rw < 1 || rh < 1 || vw < 2 || vh < 2 {
 		return
 	}
-	px := int(regionX.Load()) + min(max(x, 0), rw-1)
-	py := int(regionY.Load()) + min(max(y, 0), rh-1)
+	px := int(s.regionX.Load()) + min(max(x, 0), rw-1)
+	py := int(s.regionY.Load()) + min(max(y, 0), rh-1)
 	in := mouseInput{
 		typ:       0,
 		dx:        int32((px - vx) * 65535 / (vw - 1)),
@@ -520,13 +521,14 @@ func inputLoop(s *session, peer clipPeer) {
 	desk := newDeskState()
 	desk.sync(nil)
 	lastSync := time.Now()
+	// Whatever it still holds down when it goes is let go, on this thread.
+	defer s.releaseHeld()
 	// Nudge the pointer so a sleeping display wakes up for the new viewer.
 	for _, dx := range []int32{1, -1} {
 		in := mouseInput{dx: dx, flags: mouseMove}
 		pSendInput.Call(1, uintptr(unsafe.Pointer(&in)), unsafe.Sizeof(in))
 	}
 	lastX, lastY := 0, 0
-	btnFlags := [5][2]uint32{{0x4, 0x2}, {0x10, 0x8}, {0x40, 0x20}, {0x100, 0x80}, {0x100, 0x80}}
 	for {
 		t, p, err := s.c.Read()
 		if err != nil {
@@ -566,8 +568,8 @@ func inputLoop(s *session, peer clipPeer) {
 			}
 			if len(p) >= 5 {
 				s.clipOn.Store(p[4] != 0)
-				if workerMode {
-					clipRelayState(clipEnabled())
+				if workerMode && inControl(s) {
+					clipRelayResume()
 				}
 			}
 		case proto.MsgSelectMonitor:
@@ -576,10 +578,19 @@ func inputLoop(s *session, peer clipPeer) {
 			}
 		case proto.MsgSetResolution:
 			if len(p) >= 4 {
+				// The resolution is the PC's own, shared by everyone
+				// watching, so only the client in control may change it.
+				if !inControl(s) {
+					tell(s, "The resolution was not changed: another PC is in control of this one. Take control first.")
+					continue
+				}
 				go changeResolution(s, int(binary.LittleEndian.Uint16(p)), int(binary.LittleEndian.Uint16(p[2:])))
 			}
+		case proto.MsgTakeControl:
+			takeControl(s)
 		case proto.MsgAction:
 			if len(p) >= 1 {
+				takeControl(s)
 				doAction(s, p[0])
 			}
 		case proto.MsgUpdateBegin, proto.MsgUpdateData, proto.MsgUpdateEnd:
@@ -591,33 +602,45 @@ func inputLoop(s *session, peer clipPeer) {
 				continue
 			}
 			lastX, lastY = int(binary.LittleEndian.Uint16(p)), int(binary.LittleEndian.Uint16(p[2:]))
-			sendMouse(lastX, lastY, 0, 0)
+			// Moving the pointer does not take control: a client that is
+			// only looking must not pull it away from the one working.
+			if inControl(s) {
+				sendMouse(s, lastX, lastY, 0, 0)
+			}
 		case proto.MsgMouseBtn:
 			if len(p) < 6 || p[0] > 4 {
 				continue
 			}
 			lastX, lastY = int(binary.LittleEndian.Uint16(p[2:])), int(binary.LittleEndian.Uint16(p[4:]))
-			var data uint32
-			if p[0] >= 3 {
-				data = uint32(p[0]) - 2 // XBUTTON1 / XBUTTON2
-			}
 			down := 0
 			if p[1] != 0 {
 				down = 1
+				takeControl(s) // a click takes control
 			}
-			sendMouse(lastX, lastY, btnFlags[p[0]][down], data)
+			if !inControl(s) {
+				continue // the release of a press made before control moved on
+			}
+			s.buttonChange(p[0], down == 1, lastX, lastY)
+			sendMouse(s, lastX, lastY, buttonFlags[p[0]][down], buttonData(p[0]))
 		case proto.MsgWheel:
 			if len(p) < 3 {
 				continue
 			}
+			takeControl(s) // so does scrolling
 			delta := int32(int16(binary.LittleEndian.Uint16(p)))
 			flags := uint32(0x0800)
 			if p[2] != 0 {
 				flags = 0x1000
 			}
-			sendMouse(lastX, lastY, flags, uint32(delta))
+			sendMouse(s, lastX, lastY, flags, uint32(delta))
 		case proto.MsgKey:
 			if len(p) < 5 {
+				continue
+			}
+			up := p[4]&2 != 0
+			if !up {
+				takeControl(s) // and so does typing
+			} else if !inControl(s) {
 				continue
 			}
 			in := keybdInput{typ: 1}
@@ -631,8 +654,14 @@ func inputLoop(s *session, peer clipPeer) {
 			if p[4]&1 != 0 {
 				in.flags |= 0x0001 // KEYEVENTF_EXTENDEDKEY
 			}
-			if p[4]&2 != 0 {
+			id := uint32(vk) | uint32(scan)<<16
+			if up {
 				in.flags |= 0x0002 // KEYEVENTF_KEYUP
+				s.keyUp(id)
+			} else {
+				release := in
+				release.flags |= 0x0002
+				s.keyDown(id, release)
 			}
 			pSendInput.Call(1, uintptr(unsafe.Pointer(&in)), unsafe.Sizeof(in))
 		}
@@ -676,6 +705,7 @@ func videoLoop(s *session) {
 		}
 	}
 	lastCursor := uint16(0)
+	lastPointer := [3]int{-1, -1, -1} // the pointer position last sent: x, y, visible
 
 	var c capturer
 	defer c.free()
@@ -738,10 +768,10 @@ func videoLoop(s *session) {
 		}
 		if changed {
 			prev = nil
-			regionX.Store(int32(c.x))
-			regionY.Store(int32(c.y))
-			regionW.Store(int32(c.w))
-			regionH.Store(int32(c.h))
+			s.regionX.Store(int32(c.x))
+			s.regionY.Store(int32(c.y))
+			s.regionW.Store(int32(c.w))
+			s.regionH.Store(int32(c.h))
 			sz := binary.LittleEndian.AppendUint32(nil, uint32(c.w))
 			sz = binary.LittleEndian.AppendUint32(sz, uint32(c.h))
 			if s.c.Send(proto.MsgSize, false, sz) != nil {
@@ -752,7 +782,7 @@ func videoLoop(s *session) {
 			if c.selected >= 0 && len(c.parts) == 1 {
 				device = c.parts[0].device
 			}
-			shownDevice.Store(&device)
+			s.device.Store(&device)
 			s.c.Send(proto.MsgModes, false, describeModes(device, c.w, c.h))
 		}
 
@@ -767,6 +797,25 @@ func videoLoop(s *session) {
 				if s.c.Send(proto.MsgCursor, true, u16(int(id))) != nil {
 					return
 				}
+			}
+			// A client that is not the one in control cannot tell where
+			// the pointer is from the picture, which leaves it out: say.
+			if !inControl(s) {
+				px, py := int(ci.x)-c.x, int(ci.y)-c.y
+				at := [3]int{px, py, 0}
+				if ci.flags&1 != 0 && px >= 0 && py >= 0 && px < c.w && py < c.h { // CURSOR_SHOWING, and on the part shown
+					at[2] = 1
+				} else {
+					at[0], at[1] = 0, 0
+				}
+				if at != lastPointer {
+					lastPointer = at
+					if s.c.Send(proto.MsgPointer, true, u16(at[0]), u16(at[1]), []byte{byte(at[2])}) != nil {
+						return
+					}
+				}
+			} else {
+				lastPointer = [3]int{-1, -1, -1} // send afresh if control moves on
 			}
 		}
 

@@ -145,6 +145,7 @@ const (
 	wsClipChildren     = 0x02000000
 	wsTabStop          = 0x00010000
 	wsVScroll          = 0x00200000
+	wsClipSiblings     = 0x04000000
 
 	idConnect    = 1 // IDOK, so Enter in the pane connects
 	idRemember   = 101
@@ -255,6 +256,14 @@ type link struct {
 	status       atomic.Pointer[string]      // text for the pane, waiting to be collected
 	updateResult chan []byte                 // the server's answer to an update
 
+	// With several PCs connected to the same server, one of them has its
+	// mouse and keyboard. (A server older than 1.8.0 serves one PC at a
+	// time and never says, so a connection starts out in control.)
+	inControl  atomic.Bool            // this PC is the one
+	controller atomic.Pointer[string] // otherwise, the name of the PC that is
+	pointer    atomic.Uint64          // while watching, where the remote pointer is: x, y<<16, visible<<32
+	clipSeq    atomic.Uint32          // this PC's clipboard, numbered, when it stopped being in control
+
 	peer *winclip.Peer // this connection's side of clipboard sharing; nil if unavailable
 }
 
@@ -263,6 +272,7 @@ func newLink(id uintptr, c *proto.Conn, name string) *link {
 		done: make(chan struct{}), updateResult: make(chan []byte, 1)}
 	l.heard.Store(time.Now().UnixNano())
 	l.cursor.Store(arrow)
+	l.inControl.Store(true)
 	if clip != nil {
 		// Clipboard data is never dropped, but waits its turn behind input.
 		l.peer = clip.NewPeer(func(t byte, p []byte) error {
@@ -440,7 +450,12 @@ func main() {
 	hFont, _, _ = pCreateFont.Call(uintptr(h), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, uintptr(unsafe.Pointer(u16ptr("Segoe UI"))))
 
 	buildPane()
-	hView, _, _ = pCreateWindowEx.Call(0, uintptr(unsafe.Pointer(viewClass)), 0, wsChild|wsVisible, 0, 0, 10, 10, hMain, 0, inst, 0)
+	// It clips around its siblings so that the Take control button, which
+	// sits on top of it, is not painted over.
+	hView, _, _ = pCreateWindowEx.Call(0, uintptr(unsafe.Pointer(viewClass)), 0, wsChild|wsVisible|wsClipSiblings, 0, 0, 10, 10, hMain, 0, inst, 0)
+	hTake = control("BUTTON", "Another PC is in control  -  Take control", 0, 0, 0, 0, 300, 30, idTake)
+	paneCtls = paneCtls[:len(paneCtls)-1] // not part of the pane: it comes and goes on its own
+	pShowWindow.Call(hTake, 0)
 	hTabs, _, _ = pCreateWindowEx.Call(0, uintptr(unsafe.Pointer(tabsClass)), 0, wsChild, 0, 0, 10, 10, hMain, 0, inst, 0)
 	loadSettings()
 	startClipboard()
@@ -698,6 +713,11 @@ func layout() {
 		pShowWindow.Call(hTabs, 0)
 	}
 	pMoveWindow.Call(hView, uintptr(x), uintptr(y), uintptr(max(cw-x, 0)), uintptr(max(ch-y, 0)), 1)
+	// The Take control button sits at the top of the remote screen, in
+	// the middle, whenever another PC has control of it.
+	bw := min(sc(300), max(cw-x-sc(16), sc(120)))
+	pMoveWindow.Call(hTake, uintptr(x+max(cw-x-bw, 0)/2), uintptr(y+sc(8)), uintptr(bw), uintptr(sc(30)), 1)
+	showTakeControl()
 
 	// The version line sits at the bottom of the pane; the status text
 	// takes whatever height is left above it.
@@ -1026,6 +1046,9 @@ func (v *videoSink) report() string {
 	if v.decoded != "" {
 		s += "\r\n\r\n" + v.decoded
 	}
+	if !v.l.inControl.Load() {
+		return s + "\r\n\r\n" + watchingNote(v.l)
+	}
 	return s + "\r\n\r\nClick the remote screen to type there; click in this pane to type here."
 }
 
@@ -1133,7 +1156,13 @@ func postStatus(s string) {
 func startClipboard() {
 	// Earlier versions kept pasted files here; nothing does any more.
 	os.RemoveAll(filepath.Join(os.TempDir(), "Deskbridge", "Clipboard"))
-	c := &winclip.Sync{Enabled: clipOn.Load, Status: postStatus, Shown: dropShown}
+	// Copy and paste is shared with the connection in front, and only
+	// while this PC is the one in control of it.
+	sharing := func() bool {
+		l := cur.Load()
+		return clipOn.Load() && (l == nil || l.inControl.Load())
+	}
+	c := &winclip.Sync{Enabled: sharing, Status: postStatus, Shown: dropShown}
 	if c.Start() {
 		clip = c
 	}
@@ -1207,6 +1236,20 @@ func receiver(l *link) {
 			jobs <- job{p[8], p[9:], r}
 		case proto.MsgPong:
 			l.pong.Store(true)
+		case proto.MsgControl:
+			if len(p) >= 1 && len(p) <= 200 {
+				name := string(p[1:])
+				l.controller.Store(&name)
+				l.inControl.Store(p[0] == 1)
+				pPostMessage.Call(hMain, wmControl, l.id, 0)
+			}
+		case proto.MsgPointer:
+			if len(p) >= 5 {
+				l.pointer.Store(uint64(binary.LittleEndian.Uint16(p)) | uint64(binary.LittleEndian.Uint16(p[2:]))<<16 | uint64(p[4]&1)<<32)
+				if cur.Load() == l && !l.inControl.Load() {
+					pPostMessage.Call(hView, wmRepaint, 0, 0)
+				}
+			}
 		case proto.MsgMonitors:
 			if d := parseDisplays(p); d != nil {
 				l.displays.Store(d)
@@ -1313,6 +1356,11 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 	case wmDropShown:
 		dropConfirmed(uint32(wParam), lParam == 1)
 		return 0
+	case wmControl: // wParam: the connection whose state of control changed
+		if tb := tabOfLink(wParam); tb != nil {
+			controlChanged(tb)
+		}
+		return 0
 	}
 	switch message {
 	case wmSize:
@@ -1343,6 +1391,8 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 			saveConnection()
 		case id == idMore && code == 0:
 			moreMenu()
+		case id == idTake && code == 0:
+			takeControlClicked()
 		case (id == idFPS || id == idQuality) && code == 1, // CBN_SELCHANGE
 			(id == idAudio || id == idSleep || id == idRemember || id == idClipboard || id == idVideo || id == idFast) && code == 0:
 			applySettings()
@@ -1686,6 +1736,12 @@ func paint(h uintptr) {
 	pStretchDIBits.Call(hdc, uintptr(dx), uintptr(dy), uintptr(dw), uintptr(dh),
 		0, 0, uintptr(fbW), uintptr(fbH),
 		uintptr(unsafe.Pointer(&fb[0])), uintptr(unsafe.Pointer(&bi)), 0, 0x00CC0020)
+	// While another PC is in control, the picture alone does not show
+	// where its pointer is: draw it.
+	if at := l.pointer.Load(); !l.inControl.Load() && at>>32&1 != 0 {
+		px, py := int(at&0xFFFF), int(at>>16&0xFFFF)
+		pDrawIconEx.Call(hdc, uintptr(dx+px*dw/fbW), uintptr(dy+py*dh/fbH), l.cursor.Load(), 0, 0, 0, 0, 3) // DI_NORMAL
+	}
 }
 
 // ---------- keyboard ----------

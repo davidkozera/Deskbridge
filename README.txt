@@ -115,7 +115,7 @@ USING THE CLIENT
     is reconnecting; "(not connected)" means the attempt failed or
     another PC took that connection over. Click Connect to try again,
     or close the tab.
-  - A PC serves one client at a time, so it can only be open in one tab.
+  - A remote PC can be open in one tab only.
 
   If a connection is lost (a network blip, the remote PC restarting,
   this PC waking from sleep), its tab reconnects by itself: it tries
@@ -123,8 +123,38 @@ USING THE CLIENT
   and returns to full screen if that is where you were. The same goes
   for the saved computer at launch if it is not answering yet. To give
   up, close the tab (or click "Stop trying" in the pane). A tab does not
-  reconnect if the password is refused or when another PC connects to
-  the same server and takes over.
+  reconnect if the password is refused, or if the server dropped it to
+  make room for another PC (a ninth one, or any second one on a server
+  older than 1.8.0).
+
+  SEVERAL PCS CONNECTED TO THE SAME REMOTE PC
+  From version 1.8.0 a server serves up to 8 PCs at once (before, a new
+  connection took the place of the old one). They all see its one real
+  screen; it does not give each its own desktop.
+
+  - One PC at a time has the mouse and keyboard. A PC takes control by
+    clicking, typing or scrolling on the remote screen, by dropping
+    files on it, or with one of the "Send to remote PC" actions. Moving
+    the pointer over the remote screen does not take control.
+  - While another PC is in control you are watching: its pointer is
+    drawn on the picture, the tab says "(watching)", and a "Take
+    control" button sits at the top of the remote screen (in full
+    screen too). Whatever the other PC was holding down is let go when
+    control passes.
+  - Each PC chooses which of the remote PC's displays it shows, and has
+    its own frame rate, quality and sound. Every PC with sound ticked
+    hears it.
+  - The resolution is the remote PC's own, so it changes for everyone.
+    Only the PC in control can change it, and a connection's saved
+    resolution is applied when it connects only if no other PC is in
+    control then.
+  - Copy and paste is shared with the PC in control. Something you copy
+    on your PC while watching is sent when you take control.
+  - When the PC in control disconnects and one other is left, that one
+    takes over; with several left, the first to act does.
+  - A client older than 1.8.0 can connect alongside others and takes
+    control the same way, but has no Take control button and does not
+    see the other PC's pointer.
 
   A lost connection is noticed within about eight seconds even when
   nothing is happening on screen, because the two PCs check on each
@@ -332,7 +362,8 @@ LIMITS
     slower than a single display, and H.264 video may not be available
     for it.
   - Sound keeps playing on the Arm PC's own speakers too.
-  - One client at a time. A new connection replaces the old one.
+  - Every connected PC shares the one real screen; there are no
+    separate desktops.
 
 TROUBLESHOOTING
   The service writes deskbridge.log in C:\Program Files\Deskbridge.
