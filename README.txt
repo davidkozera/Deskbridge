@@ -43,6 +43,80 @@ Properties > Details. The bottom of the client's left pane shows the
 client's version, the version of the server it is connected to, and
 how many frames a second are arriving.
 
+INTERNET (Alpha versions only, for now)
+  Normally the client reaches a PC by its own address, which only works
+  on the same network. With a relay, a saved connection also works from
+  anywhere, and no port has to be opened on any router: the server and
+  the client both connect out to the relay, which passes the session
+  between them. It is the same encrypted, password-checked connection
+  either way; the relay cannot see inside it.
+
+  In this version the whole session travels through the relay. A later
+  one will let the two PCs talk directly after being introduced.
+
+  1. Set up the relay, once. It is a small container; these commands
+     run it on Azure Container Apps. Paste them into Azure Cloud Shell
+     (the >_ button at portal.azure.com, Bash):
+
+       RG=deskbridge
+       LOC=canadacentral
+       KEY=$(openssl rand -hex 24)
+       az provider register --namespace Microsoft.App --wait
+       az group create --name $RG --location $LOC
+       az containerapp env create --name deskbridge-env \
+         --resource-group $RG --location $LOC --logs-destination none
+       FQDN=$(az containerapp create --name deskbridge-relay \
+         --resource-group $RG --environment deskbridge-env \
+         --image ghcr.io/davidkozera/deskbridge-relay:alpha \
+         --target-port 8080 --ingress external \
+         --min-replicas 1 --max-replicas 1 --cpu 0.25 --memory 0.5Gi \
+         --secrets relay-key=$KEY \
+         --env-vars DESKBRIDGE_RELAY_KEY=secretref:relay-key \
+         --query properties.configuration.ingress.fqdn --output tsv)
+       echo "Relay code:  https://$FQDN#$KEY"
+
+     The last line prints your relay code. Keep it somewhere safe: it
+     is the only copy of the key. Opening the https address in a
+     browser should show a line beginning "Deskbridge relay".
+
+     - Exactly one copy must run (--max-replicas 1), or the two ends
+       can land on different copies and never meet.
+     - If a command objects to --logs-destination, leave that part out.
+     - To move the relay to a newer version later:
+         az containerapp update --name deskbridge-relay \
+           --resource-group deskbridge \
+           --image ghcr.io/davidkozera/deskbridge-relay:VERSION
+
+  2. In the client, copy the relay code, then choose
+     More > Internet access: use the relay code I copied.
+
+  3. Connect once to each saved PC while on its network. The client
+     tells it the relay's address and key, the PC connects out to the
+     relay and stays connected, and the client remembers the ID it goes
+     by there. That is all the setting up a server needs.
+
+  From then on, opening a saved connection tries the PC's own address
+  first. If that has not answered within a second and a half, the relay
+  is tried as well, and whichever answers is used (the PC's own address
+  if both do). The bottom of the pane says which: "On the local
+  network" or "Over the internet, through the relay". Checking and
+  updating saved servers works through the relay in the same way.
+
+  - Only saved connections are set up this way, and each client needs
+    the relay code. Every client should use the same one: a server
+    follows whichever relay it was told about last.
+  - More > Internet access: turn off stops this client using the relay,
+    and can tell the connected PCs to stop as well.
+  - The relay key decides who may use the relay. The PC's own password
+    is still needed to connect to it.
+  - A PC that is off or asleep is not connected to the relay and cannot
+    be reached, here as on a local network.
+  - Networks that only allow web traffic through a proxy server are not
+    supported yet.
+  - A Mainline client does not keep the relay code or the IDs. After
+    going back to Mainline and returning to Alpha, paste the code and
+    connect to each PC on its network again.
+
 UPDATING
   New versions are published at
   https://github.com/davidkozera/Deskbridge/releases

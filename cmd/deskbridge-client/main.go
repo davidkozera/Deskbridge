@@ -23,6 +23,7 @@ import (
 
 	"deskbridge/internal/mf"
 	"deskbridge/internal/proto"
+	"deskbridge/internal/relay"
 	"deskbridge/internal/update"
 	"deskbridge/internal/winclip"
 )
@@ -241,7 +242,11 @@ type link struct {
 	done  chan struct{}
 	once  sync.Once
 	heard atomic.Int64 // when anything last arrived from the server
-	pong  atomic.Bool  // the server answers pings, so silence means the link is dead
+
+	relayed   bool                   // it goes through the relay rather than straight to the server
+	relayInfo atomic.Pointer[string] // "id\naddress": how the server says it can be reached through a relay
+	relayTold bool                   // UI thread: this client has told it which relay to use
+	pong      atomic.Bool            // the server answers pings, so silence means the link is dead
 
 	// The remote screen. Decoders writing disjoint areas share the read
 	// lock; the painter and resizes take the write lock.
@@ -747,7 +752,7 @@ func layout() {
 	pMoveWindow.Call(hStatus, uintptr(sc(m)), uintptr(sc(statusTop)), uintptr(sc(w)), uintptr(max(versionY-sc(statusTop)-sc(8), sc(16))), 1)
 }
 
-const versionLineH = 18
+const versionLineH = 54 // three lines
 
 // refreshVersionLine fills in the line at the bottom of the pane.
 func refreshVersionLine() {
@@ -758,10 +763,20 @@ func refreshVersionLine() {
 			server = *v
 		}
 	}
-	line := "Client " + proto.Version + "   |   Server " + server
+	// A line each, so that long version names (1.11.0-alpha.2) fit.
+	line := "Client " + proto.Version + "\r\nServer " + server
 	if cur.Load() != nil && measuredFPS >= 0 {
 		// What is actually arriving, which can be well under the setting.
 		line += "   |   " + strconv.Itoa(measuredFPS) + " fps"
+	}
+	// The last line: how the connection in front reaches its PC.
+	switch l := cur.Load(); {
+	case l != nil && l.relayed:
+		line += "\r\nOver the internet, through the relay"
+	case l != nil:
+		line += "\r\nOn the local network"
+	case relayAddress != "":
+		line += "\r\nInternet access: on"
 	}
 	setText(hVersion, line)
 }
@@ -889,6 +904,11 @@ func saveSettings() {
 		"remember=" + b(checked(hRemember)),
 		"channel=" + update.ChannelKey(int(releaseChannel.Load())),
 	}
+	if relayAddress != "" {
+		if enc := dpapi(pCryptProtectData, []byte(relayKey)); enc != nil {
+			lines = append(lines, "relay="+relayAddress, "relaykey="+hex.EncodeToString(enc))
+		}
+	}
 	// The tabs to open again next time, and the one in front.
 	var open []string
 	for _, tb := range tabs {
@@ -913,6 +933,12 @@ func saveSettings() {
 
 func loadSettings() {
 	var lastPassword []byte
+	savedRelay, savedRelayKey := "", ""
+	defer func() {
+		if savedRelay != "" && len(savedRelayKey) >= relay.MinKey {
+			relayAddress, relayKey = savedRelay, savedRelayKey
+		}
+	}()
 	oldDisplay := noPreference // from before each connection kept its own
 	data, err := os.ReadFile(settingsPath())
 	if err != nil {
@@ -955,6 +981,14 @@ func loadSettings() {
 			setChecked(hRemember, v == "1")
 		case "channel":
 			releaseChannel.Store(int32(update.ChannelFromKey(v)))
+		case "relay":
+			if relay.CheckAddress(v) == nil {
+				savedRelay = v
+			}
+		case "relaykey":
+			if enc, err := hex.DecodeString(v); err == nil {
+				savedRelayKey = string(dpapi(pCryptUnprotectData, enc))
+			}
 		case "open":
 			launchTabsKnown = true
 			if v != "" {
@@ -1285,6 +1319,12 @@ func receiver(l *link) {
 				l.inControl.Store(p[0] == 1)
 				pPostMessage.Call(hMain, wmControl, l.id, 0)
 			}
+		case proto.MsgRelayInfo:
+			if len(p) <= 400 {
+				info := string(p)
+				l.relayInfo.Store(&info)
+				pPostMessage.Call(hMain, wmRelayInfo, l.id, 0)
+			}
 		case proto.MsgPointer:
 			if len(p) >= 5 {
 				l.pointer.Store(uint64(binary.LittleEndian.Uint16(p)) | uint64(binary.LittleEndian.Uint16(p[2:]))<<16 | uint64(p[4]&1)<<32)
@@ -1397,6 +1437,11 @@ func mainProc(h, message, wParam, lParam uintptr) uintptr {
 		return 0
 	case wmDropShown:
 		dropConfirmed(uint32(wParam), lParam == 1)
+		return 0
+	case wmRelayInfo: // wParam: the connection whose server said how it is reached through the relay
+		if tb := tabOfLink(wParam); tb != nil {
+			relayInfoArrived(tb)
+		}
 		return 0
 	case wmControl: // wParam: the connection whose state of control changed
 		if tb := tabOfLink(wParam); tb != nil {

@@ -464,12 +464,14 @@ func connectTo(tb *tab, auto bool) {
 	}
 	nextLinkID++
 	id, tabID, t := nextLinkID, tb.id, tb.target
+	rt := routeTo(t.name, t.host, t.port)
 	go func() {
 		res := &connectResult{tab: tabID, target: t, auto: auto}
-		addr := net.JoinHostPort(t.host, t.port)
-		nc, err := net.DialTimeout("tcp", addr, timeout)
+		// Its own address first; through the relay if that does not answer
+		// and the PC has a place there (see internet.go).
+		nc, relayed, err := rt.dial(timeout)
 		if err != nil {
-			res.err = "Could not reach " + addr + ".\r\n\r\nCheck that Deskbridge is running on that PC and that both PCs are on the same network."
+			res.err = describeRouteError(err, t.host, t.port)
 		} else {
 			if tc, ok := nc.(*net.TCPConn); ok {
 				tc.SetNoDelay(true)
@@ -483,6 +485,7 @@ func connectTo(tb *tab, auto bool) {
 				res.err = "Connection failed: " + err.Error()
 			} else {
 				res.l = newLink(id, proto.NewConn(tc), t.name)
+				res.l.relayed = relayed
 			}
 		}
 		connectResults <- res
@@ -619,7 +622,11 @@ func connectFinished(res *connectResult) {
 	go receiver(l)
 	go heartbeat(l)
 	sendSettings(l)
-	tb.status = "Connected to " + tb.target.name + ".\r\n\r\nClick the remote screen to type on the remote PC. Click in this pane to get your own keyboard back." + videoNote()
+	how := ""
+	if l.relayed {
+		how = " over the internet, through the relay"
+	}
+	tb.status = "Connected to " + tb.target.name + how + ".\r\n\r\nClick the remote screen to type on the remote PC. Click in this pane to get your own keyboard back." + videoNote()
 	if !res.auto {
 		rememberComputer(tb)
 	}

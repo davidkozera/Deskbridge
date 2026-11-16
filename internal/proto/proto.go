@@ -29,6 +29,7 @@ const (
 	MsgPong         = 11 // the answer to MsgPing
 	MsgPointer      = 13 // x u16, y u16, visible u8: where the remote pointer is on the picture, for a client that is not the one moving it
 	MsgControl      = 14 // u8 (1: this client is in control of the mouse and keyboard; 0: it is not), then the name of the PC that is
+	MsgRelayInfo    = 15 // "id\naddress": this server's ID at its relay and the relay's address, or "\n" if it uses none (see internal/relay)
 	MsgModes        = 12 // current w u16, h u16, count u8, then that many (w u16, h u16): resolutions the shown display supports
 )
 
@@ -47,6 +48,7 @@ const (
 	MsgSelectMonitor = 26 // i8: which display to show, -1 for all of them
 	MsgAction        = 27 // u8: one of the Action values
 	MsgTakeControl   = 43 // this client wants the mouse and keyboard (clicking or typing takes them too)
+	MsgRelaySet      = 44 // "address\nkey": use this relay to be reachable across the internet; empty to stop
 	MsgPing          = 28 // "are you there?", sent every couple of seconds
 	MsgSetResolution = 29 // w u16, h u16: change the shown display's resolution; 0,0 puts it back
 )

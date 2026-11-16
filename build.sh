@@ -36,4 +36,7 @@ gzip -9 -n -c README.txt > "$PAYLOAD/README.txt.gz"
 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS -H windowsgui" \
 	-o "dist/Deskbridge-Setup-$VERSION.exe" ./cmd/deskbridge-setup
 
-echo "Built dist/Deskbridge-Setup-$VERSION.exe"
+# The relay (see README: INTERNET) runs on Linux, as a container.
+GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/deskbridge-relay ./cmd/deskbridge-relay
+
+echo "Built dist/Deskbridge-Setup-$VERSION.exe and dist/deskbridge-relay"

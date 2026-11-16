@@ -297,3 +297,26 @@ type msg struct {
 	pt      [2]int32
 	private uint32
 }
+
+// ReadText returns the text on the clipboard, or "" if there is none.
+func ReadText(hwnd uintptr) string {
+	if !open(hwnd) {
+		return ""
+	}
+	defer pCloseClipboard.Call()
+	h, _, _ := pGetClipboardData.Call(cfUnicodeText)
+	if h == 0 {
+		return ""
+	}
+	size, _, _ := pGlobalSize.Call(h)
+	if size < 2 || size > 64<<10 {
+		return ""
+	}
+	p, _, _ := pGlobalLock.Call(h)
+	if p == 0 {
+		return ""
+	}
+	defer pGlobalUnlock.Call(h)
+	units := unsafe.Slice((*uint16)(unsafe.Pointer(p)), size/2)
+	return syscall.UTF16ToString(units)
+}

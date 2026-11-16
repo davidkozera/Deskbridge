@@ -13,6 +13,7 @@ import (
 	"unsafe"
 
 	"deskbridge/internal/proto"
+	"deskbridge/internal/relay"
 )
 
 const (
@@ -41,6 +42,7 @@ type computer struct {
 	modes            []resolution // what its display offered when last connected
 	opts             options      // its frame rate, quality and tick boxes
 	hasOpts          bool         // false for one saved before each connection kept its own
+	relayID          string       // what it goes by at the relay, once it has said (see internet.go)
 }
 
 // target is everything needed to connect.
@@ -335,7 +337,7 @@ func computerLines() []string {
 			opts = c.opts.String()
 		}
 		lines = append(lines, "connection="+strings.Join([]string{c.name, c.host, c.port, hex.EncodeToString(c.password),
-			c.res.String(), strconv.Itoa(c.display), strings.Join(modes, ","), opts}, "|"))
+			c.res.String(), strconv.Itoa(c.display), strings.Join(modes, ","), opts, c.relayID}, "|"))
 	}
 	return lines
 }
@@ -368,6 +370,9 @@ func parseConnection(v string) {
 	}
 	if len(parts) > 7 {
 		c.opts, c.hasOpts = parseOptions(parts[7])
+	}
+	if len(parts) > 8 && relay.ValidID(parts[8]) {
+		c.relayID = parts[8]
 	}
 	computers = append(computers, c)
 }

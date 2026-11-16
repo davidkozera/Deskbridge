@@ -26,6 +26,7 @@ on:
 
 permissions:
   contents: write
+  packages: write # the relay's container image
 
 jobs:
   release:
@@ -74,6 +75,24 @@ jobs:
         env:
           DESKBRIDGE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
         run: go run ./tools/sign -version "${{ steps.version.outputs.version }}" "dist/Deskbridge-Setup-${{ steps.version.outputs.version }}.exe"
+
+      # The relay as a container image, for whoever hosts one (see README:
+      # INTERNET). Tagged with the version, and with the channel's name
+      # ("alpha", "beta", or "latest" for Mainline).
+      - name: Publish the relay image
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${{ steps.version.outputs.version }}"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/deskbridge-relay"
+          CHANNEL="$GITHUB_REF_NAME"
+          if [ "$CHANNEL" = main ]; then CHANNEL=latest; fi
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build -t "$IMAGE:$V" -t "$IMAGE:$CHANNEL" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.description=Deskbridge relay $V" .
+          docker push "$IMAGE:$V"
+          docker push "$IMAGE:$CHANNEL"
 
       - name: Publish
         env:

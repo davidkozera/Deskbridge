@@ -42,6 +42,7 @@ const (
 
 type savedServer struct {
 	name, host, port, password string
+	rt                         route // how to reach it, set when it is to be contacted
 	state                      int
 	version                    string
 }
@@ -68,7 +69,7 @@ func checkServers() {
 	var list []savedServer
 	seen := map[string]bool{}
 	for _, c := range computers {
-		o := savedServer{name: c.name, host: c.host, port: c.port}
+		o := savedServer{name: c.name, host: c.host, port: c.port, rt: routeTo(c.name, c.host, c.port)}
 		if pw := dpapi(pCryptUnprotectData, c.password); pw != nil && !seen[o.key()] {
 			seen[o.key()] = true
 			o.password = string(pw)
@@ -77,7 +78,8 @@ func checkServers() {
 	}
 	// Open tabs count too, saved or not: their passwords are at hand.
 	for _, tb := range tabs {
-		o := savedServer{name: tb.target.name, host: tb.target.host, port: tb.target.port, password: tb.target.password}
+		o := savedServer{name: tb.target.name, host: tb.target.host, port: tb.target.port, password: tb.target.password,
+			rt: routeTo(tb.target.name, tb.target.host, tb.target.port)}
 		if !seen[o.key()] {
 			seen[o.key()] = true
 			list = append(list, o)
@@ -166,7 +168,11 @@ func (m *maintenance) close() { m.tc.Close() }
 func openMaintenance(o savedServer, takeOver bool) (*maintenance, int) {
 	key := proto.DeriveKey(o.password)
 	dial := func(role string) (*tls.Conn, error) {
-		nc, err := net.DialTimeout("tcp", net.JoinHostPort(o.host, o.port), 4*time.Second)
+		rt := o.rt
+		if rt.host == "" {
+			rt = route{host: o.host, port: o.port}
+		}
+		nc, _, err := rt.dial(4 * time.Second)
 		if err != nil {
 			return nil, err
 		}

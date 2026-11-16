@@ -181,6 +181,7 @@ func main() {
 	allowSleep.Store(*flagSleep)
 	go powerLoop()
 	startClipboard()
+	startRelay(func(nc net.Conn) { serve(nc, cfg, key) })
 	if workerMode {
 		log.Printf("worker %s listening on port %s", proto.Version, *flagPort)
 		for {
@@ -310,6 +311,7 @@ func serve(nc net.Conn, cfg *tls.Config, key []byte) {
 	// whether it is in control before anything else is sent.
 	addSession(s)
 	log.Printf("%s: connected", remote)
+	s.c.Send(proto.MsgRelayInfo, true, relayInfo())
 
 	go videoLoop(s)
 	if !*flagNoAudio {
@@ -588,6 +590,17 @@ func inputLoop(s *session, peer clipPeer) {
 			}
 		case proto.MsgTakeControl:
 			takeControl(s)
+		case proto.MsgRelaySet:
+			// From a client that has given this PC's password, so it may
+			// decide how this PC can be reached.
+			address, key, _ := strings.Cut(string(p), "\n")
+			if len(p) > 600 {
+				address, key = "?", ""
+			}
+			if err := setRelay(strings.TrimSpace(address), strings.TrimSpace(key)); err != nil {
+				s.c.Send(proto.MsgNotice, true, append([]byte{proto.NoticeGeneral}, "Internet access was not set up on the remote PC: "+err.Error()+"."...))
+			}
+			s.c.Send(proto.MsgRelayInfo, true, relayInfo())
 		case proto.MsgAction:
 			if len(p) >= 1 {
 				takeControl(s)
