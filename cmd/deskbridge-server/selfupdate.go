@@ -7,8 +7,9 @@ package main
 // When the person clicks Update in the client, the client sends the new
 // setup program over the existing connection. The server never trusts it on
 // the client's say-so: it checks the publisher's signature (see
-// internal/update) and that the version really is newer, and only then runs
-// it. Setup replaces the service and starts it again, so the connection
+// internal/update) and that the version is one it may move to (a newer one,
+// or a more settled release channel's: see update.Allowed), and only then
+// runs it. Setup replaces the service and starts it again, so the connection
 // drops for a few seconds.
 
 import (
@@ -56,8 +57,10 @@ func (u *updateReceiver) handle(s *session, t byte, p []byte) {
 		switch {
 		case !workerMode:
 			refuse("it was started by hand rather than installed, so it cannot update itself. Run setup on that PC.")
-		case !update.Newer(parts[0], proto.Version):
+		case parts[0] == proto.Version:
 			refuse("it already runs version " + proto.Version + ".")
+		case !update.Allowed(proto.Version, parts[0]):
+			refuse("it runs version " + proto.Version + ", which cannot be replaced by version " + parts[0] + ".")
 		case size <= 0 || size > update.MaxInstaller:
 			refuse("the update is an unexpected size.")
 		default:

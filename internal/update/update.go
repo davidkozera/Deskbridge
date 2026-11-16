@@ -37,36 +37,141 @@ var (
 	downloadPrefix = "https://github.com/" + Repo + "/releases/download/"
 )
 
-// Parse reads a version such as "1.2.3". Anything else ("dev") is not a
-// version, and such builds neither offer nor accept updates.
-func Parse(v string) (n [3]int, ok bool) {
-	parts := strings.Split(strings.TrimPrefix(strings.TrimSpace(v), "v"), ".")
+// Release channels, from the least settled to the most. A PC follows one
+// channel; the more settled ones are always acceptable to it too, so a PC
+// on Alpha also takes a Beta or Mainline version that is newer.
+const (
+	Alpha = iota
+	Beta
+	Mainline
+)
+
+// ChannelName is a channel's name as shown to the person.
+func ChannelName(channel int) string {
+	switch channel {
+	case Alpha:
+		return "Alpha"
+	case Beta:
+		return "Beta"
+	}
+	return "Mainline"
+}
+
+// ChannelKey is a channel's name in settings files, and ChannelFromKey reads
+// it back (anything unknown is Mainline).
+func ChannelKey(channel int) string { return strings.ToLower(ChannelName(channel)) }
+
+func ChannelFromKey(key string) int {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "alpha":
+		return Alpha
+	case "beta":
+		return Beta
+	}
+	return Mainline
+}
+
+// Floor is the first version that understands channels. Nothing is ever
+// moved back to a version before it.
+const Floor = "1.10.0"
+
+// Version is a parsed version: "1.2.3" on Mainline, or "1.2.3-alpha.4" and
+// "1.2.3-beta.4" for the fourth Alpha or Beta build leading up to 1.2.3.
+type Version struct {
+	N       [3]int
+	Channel int
+	Build   int // 0 on Mainline
+}
+
+func number(s string) (int, bool) {
+	if len(s) == 0 || len(s) > 5 {
+		return 0, false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(s)
+	return n, err == nil
+}
+
+// Parse reads a version. Anything else ("dev") is not a version, and such
+// builds neither offer nor accept updates.
+func Parse(v string) (Version, bool) {
+	core, pre, isPre := strings.Cut(strings.TrimPrefix(strings.TrimSpace(v), "v"), "-")
+	out := Version{Channel: Mainline}
+	parts := strings.Split(core, ".")
 	if len(parts) != 3 {
-		return n, false
+		return Version{}, false
 	}
 	for i, p := range parts {
-		x, err := strconv.Atoi(p)
-		if err != nil || x < 0 || x > 99999 {
-			return n, false
+		x, ok := number(p)
+		if !ok {
+			return Version{}, false
 		}
-		n[i] = x
+		out.N[i] = x
 	}
-	return n, true
+	if isPre {
+		name, build, _ := strings.Cut(pre, ".")
+		switch name {
+		case "alpha":
+			out.Channel = Alpha
+		case "beta":
+			out.Channel = Beta
+		default:
+			return Version{}, false
+		}
+		b, ok := number(build)
+		if !ok || b < 1 {
+			return Version{}, false
+		}
+		out.Build = b
+	}
+	return out, true
+}
+
+// compare orders versions: by number first, then Alpha before Beta before
+// the finished version of the same number, then by build.
+func compare(a, b Version) int {
+	for i := range a.N {
+		if a.N[i] != b.N[i] {
+			return a.N[i] - b.N[i]
+		}
+	}
+	if a.Channel != b.Channel {
+		return a.Channel - b.Channel
+	}
+	return a.Build - b.Build
 }
 
 // Newer reports whether version a is newer than version b.
 func Newer(a, b string) bool {
 	x, ok1 := Parse(a)
 	y, ok2 := Parse(b)
+	return ok1 && ok2 && compare(x, y) > 0
+}
+
+// Allowed reports whether a PC running version from may be moved to version
+// to. Moving to something newer is always allowed. Moving back is allowed
+// only to leave Alpha or Beta for a more settled channel, and never to a
+// version from before channels existed; a Mainline PC is never moved back.
+// A PC from before channels existed cannot read an Alpha or Beta version at
+// all, so it must reach a current Mainline version first.
+func Allowed(from, to string) bool {
+	f, ok1 := Parse(from)
+	t, ok2 := Parse(to)
+	floor, _ := Parse(Floor)
 	if !ok1 || !ok2 {
 		return false
 	}
-	for i := range x {
-		if x[i] != y[i] {
-			return x[i] > y[i]
-		}
+	if t.Channel != Mainline && compare(f, floor) < 0 {
+		return false
 	}
-	return false
+	if compare(t, f) > 0 {
+		return true
+	}
+	return t.Channel > f.Channel && compare(t, floor) >= 0
 }
 
 // AssetName is the setup program's file name in a release.
@@ -151,26 +256,19 @@ var errNotFound = errors.New("not found")
 // public).
 var ErrNoRelease = errors.New("no published version was found")
 
-func release(ctx context.Context, path string) (Release, error) {
-	data, err := get(ctx, apiBase+path, 4<<20)
-	if errors.Is(err, errNotFound) {
-		return Release{}, ErrNoRelease
-	}
-	if err != nil {
-		return Release{}, err
-	}
-	var doc struct {
-		Tag    string `json:"tag_name"`
-		Assets []struct {
-			Name string `json:"name"`
-			URL  string `json:"browser_download_url"`
-		} `json:"assets"`
-	}
-	if err := json.Unmarshal(data, &doc); err != nil {
-		return Release{}, errors.New("GitHub's answer could not be read")
-	}
+// releaseDoc is the part of GitHub's description of a release used here.
+type releaseDoc struct {
+	Tag    string `json:"tag_name"`
+	Draft  bool   `json:"draft"`
+	Assets []struct {
+		Name string `json:"name"`
+		URL  string `json:"browser_download_url"`
+	} `json:"assets"`
+}
+
+func fromDoc(doc releaseDoc) (Release, error) {
 	r := Release{Version: strings.TrimPrefix(doc.Tag, "v")}
-	if _, ok := Parse(r.Version); !ok {
+	if _, ok := Parse(r.Version); !ok || doc.Draft {
 		return Release{}, ErrNoRelease
 	}
 	for _, a := range doc.Assets {
@@ -190,8 +288,62 @@ func release(ctx context.Context, path string) (Release, error) {
 	return r, nil
 }
 
-// Latest returns the newest published version.
-func Latest(ctx context.Context) (Release, error) { return release(ctx, "/releases/latest") }
+func release(ctx context.Context, path string) (Release, error) {
+	data, err := get(ctx, apiBase+path, 4<<20)
+	if errors.Is(err, errNotFound) {
+		return Release{}, ErrNoRelease
+	}
+	if err != nil {
+		return Release{}, err
+	}
+	var doc releaseDoc
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return Release{}, errors.New("GitHub's answer could not be read")
+	}
+	return fromDoc(doc)
+}
+
+// Latest returns the newest published version a PC on the given channel
+// should run: the newest Mainline version, or for Beta and Alpha the newest
+// of that channel and the more settled ones.
+func Latest(ctx context.Context, channel int) (Release, error) {
+	if channel >= Mainline {
+		// GitHub's "latest" never names an Alpha or Beta version, which
+		// are published as pre-releases.
+		return release(ctx, "/releases/latest")
+	}
+	data, err := get(ctx, apiBase+"/releases?per_page=40", 16<<20)
+	if errors.Is(err, errNotFound) {
+		return Release{}, ErrNoRelease
+	}
+	if err != nil {
+		return Release{}, err
+	}
+	var docs []releaseDoc
+	if err := json.Unmarshal(data, &docs); err != nil {
+		return Release{}, errors.New("GitHub's answer could not be read")
+	}
+	var best Release
+	var bestV Version
+	found := false
+	for _, doc := range docs {
+		r, err := fromDoc(doc)
+		if err != nil {
+			continue
+		}
+		v, _ := Parse(r.Version)
+		if v.Channel < channel {
+			continue
+		}
+		if !found || compare(v, bestV) > 0 {
+			best, bestV, found = r, v, true
+		}
+	}
+	if !found {
+		return Release{}, ErrNoRelease
+	}
+	return best, nil
+}
 
 // ByVersion returns a particular published version.
 func ByVersion(ctx context.Context, version string) (Release, error) {

@@ -136,11 +136,11 @@ func behind(target string) []savedServer {
 		}
 		switch o.state {
 		case serverAnswered:
-			if o.version != "" && update.Newer(target, o.version) {
+			if o.version != "" && update.Allowed(o.version, target) {
 				out = append(out, o)
 			}
 		case serverOld:
-			if update.Newer(target, "1.4.0") {
+			if update.Allowed("1.4.0", target) {
 				out = append(out, o)
 			}
 		}
@@ -271,8 +271,11 @@ func updateServer(o savedServer, version, signature string, installer []byte) (s
 	}
 	defer m.close()
 	o.version = m.version
-	if m.version != "" && !update.Newer(version, m.version) {
-		return o.name + ": already runs version " + m.version + ".", o
+	if m.version != "" && !update.Allowed(m.version, version) {
+		if m.version == version {
+			return o.name + ": already runs version " + m.version + ".", o
+		}
+		return o.name + ": runs version " + m.version + ", which cannot be replaced by version " + version + ".", o
 	}
 	ok, why := m.push(version, signature, installer)
 	if !ok {

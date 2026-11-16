@@ -17,6 +17,7 @@ import (
 	"unsafe"
 
 	"deskbridge/internal/connfile"
+	"deskbridge/internal/update"
 )
 
 const idMore = 118
@@ -94,6 +95,7 @@ func moreMenu() {
 	const exportID, importID = 1, 2
 	pAppendMenu.Call(menu, 0, exportID, uintptr(unsafe.Pointer(u16ptr("Export connections..."))))
 	pAppendMenu.Call(menu, 0, importID, uintptr(unsafe.Pointer(u16ptr("Import connections..."))))
+	addChannelMenu(menu)
 	var rc rect
 	pGetWindowRect.Call(hMore, uintptr(unsafe.Pointer(&rc)))
 	// TPM_RETURNCMD | TPM_NONOTIFY: just tell us what was picked.
@@ -102,6 +104,8 @@ func moreMenu() {
 		exportConnections()
 	case importID:
 		importConnections()
+	case channelMenuBase + update.Alpha, channelMenuBase + update.Beta, channelMenuBase + update.Mainline:
+		channelPicked(int(choice) - channelMenuBase)
 	}
 }
 

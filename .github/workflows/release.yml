@@ -1,6 +1,17 @@
 # Builds Deskbridge and publishes it as a GitHub release whenever the VERSION
-# file changes on main. Installed copies find the release, check its
-# signature, and offer it through the client's Update button.
+# file changes on one of the release branches. Installed copies find the
+# release, check its signature, and offer it through the client's Update
+# button.
+#
+# There are three release channels, each published from its own branch:
+#   main   Mainline   VERSION like 1.10.0           a normal release
+#   beta   Beta       VERSION like 1.11.0-beta.1    a pre-release
+#   alpha  Alpha      VERSION like 1.11.0-alpha.1   a pre-release
+# A client follows Mainline unless told otherwise (More > Releases), and
+# GitHub's "latest release" only ever names a Mainline version, so Beta and
+# Alpha versions reach nobody who has not asked for them. The version must
+# suit the branch, or nothing is published: that stops a merge between
+# branches from publishing a test version as a finished one.
 #
 # Needs one repository secret, UPDATE_SIGNING_KEY: the private half of the
 # key whose public half is in internal/update/key.go.
@@ -9,7 +20,7 @@ name: Release
 
 on:
   push:
-    branches: [main]
+    branches: [main, beta, alpha]
     paths: [VERSION]
   workflow_dispatch:
 
@@ -29,6 +40,20 @@ jobs:
       - name: Read version
         id: version
         run: echo "version=$(tr -d ' \r\n' < VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Check the version suits this branch
+        run: |
+          V="${{ steps.version.outputs.version }}"
+          case "$GITHUB_REF_NAME" in
+            main)  WANT='^[0-9]+\.[0-9]+\.[0-9]+$' ;;
+            beta)  WANT='^[0-9]+\.[0-9]+\.[0-9]+-beta\.[1-9][0-9]*$' ;;
+            alpha) WANT='^[0-9]+\.[0-9]+\.[0-9]+-alpha\.[1-9][0-9]*$' ;;
+            *) echo "::error::Releases are only published from the main, beta and alpha branches, not from $GITHUB_REF_NAME."; exit 1 ;;
+          esac
+          if ! printf '%s' "$V" | grep -Eq "$WANT"; then
+            echo "::error::Version $V does not suit the $GITHUB_REF_NAME branch. main takes 1.2.3, beta takes 1.2.3-beta.1, alpha takes 1.2.3-alpha.1."
+            exit 1
+          fi
 
       - name: Stop if this version is already published
         env:
@@ -55,9 +80,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           V="${{ steps.version.outputs.version }}"
+          if [ "$GITHUB_REF_NAME" = main ]; then
+            KIND="--latest"
+            NOTES="Run Deskbridge-Setup-$V.exe on each PC, or click Update in the Deskbridge client. The .sig file is the signature installed copies check before updating."
+          else
+            KIND="--prerelease --latest=false"
+            NOTES="A test version from the $GITHUB_REF_NAME branch. It is offered only to clients set to follow it (More > Releases). The .sig file is the signature installed copies check before updating."
+          fi
           gh release create "v$V" \
             "dist/Deskbridge-Setup-$V.exe" \
             "dist/Deskbridge-Setup-$V.exe.sig" \
             --target "$GITHUB_SHA" \
             --title "Deskbridge $V" \
-            --notes "Run Deskbridge-Setup-$V.exe on each PC, or click Update in the Deskbridge client. The .sig file is the signature installed copies check before updating."
+            --notes "$NOTES" \
+            $KIND

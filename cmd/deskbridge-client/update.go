@@ -10,6 +10,11 @@ package main
 // any of those servers is behind, an Update button appears in the pane and
 // the window title says so.
 //
+// Which versions count is set by the release channel chosen under "More":
+// Mainline, Beta or Alpha (see channel.go). Changing it offers to move this
+// PC and its servers to that channel's newest version, which can be an
+// older one when leaving Alpha or Beta.
+//
 // One click then: downloads the setup program and checks its signature;
 // sends it to the connected server over the existing connection and to the
 // other saved servers over connections of their own, all at once, where it
@@ -45,13 +50,14 @@ var (
 	pShellExecute  = syscall.NewLazyDLL("shell32.dll").NewProc("ShellExecuteW")
 	pDestroyWindow = user32.NewProc("DestroyWindow")
 
-	latestRelease atomic.Pointer[update.Release] // newest published version, once known
+	latestRelease atomic.Pointer[foundRelease] // newest published version, once known
 	updateText    atomic.Pointer[string]
 	setupFile     atomic.Pointer[string]
 
 	// Touched only on the UI thread.
 	hUpdate       uintptr
-	updateOffered bool
+	updateOffered bool // something can be moved: the button shows
+	updateNewer   bool // and at least one of those moves is to a newer version
 	updating      bool
 	titleBase     = "Deskbridge"
 	updateNote    string // what to keep on screen when the server restarts for its update
@@ -62,7 +68,7 @@ var (
 // (the pane with the button is usually hidden).
 func setTitle(s string) {
 	titleBase = s
-	if updateOffered {
+	if updateNewer {
 		s += "  -  update available: open the left pane"
 	}
 	setText(hMain, s)
@@ -73,17 +79,37 @@ func watchForUpdates() {
 	if _, ok := update.Parse(proto.Version); !ok {
 		return // a development build
 	}
+	asked := false // this check follows a change of channel, so say how it went
 	for {
+		channel := releaseChannel.Load()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		rel, err := update.Latest(ctx)
+		rel, err := update.Latest(ctx, int(channel))
 		cancel()
-		if err == nil {
-			latestRelease.Store(&rel)
+		name := update.ChannelName(int(channel))
+		switch {
+		case err == nil:
+			latestRelease.Store(&foundRelease{rel, channel})
+			if asked {
+				updateProgress("Following " + name + " releases. The newest version is " + rel.Version + ".")
+			}
 			pPostMessage.Call(hMain, wmUpdateInfo, 0, 0)
+		case asked:
+			updateProgress("Following " + name + " releases, but the newest version could not be looked up: " + err.Error() + ".")
 		}
 		pPostMessage.Call(hMain, wmCheckServers, 0, 0)
-		time.Sleep(6 * time.Hour)
+		select {
+		case <-checkNow: // the channel was changed
+			asked = true
+		case <-time.After(6 * time.Hour):
+			asked = false
+		}
 	}
+}
+
+// foundRelease is a published version and the channel it was looked up for.
+type foundRelease struct {
+	rel     update.Release
+	channel int32
 }
 
 // liveServer is a connected server that should be updated, with the name
@@ -96,19 +122,30 @@ type liveServer struct {
 // updatePlan works out what, if anything, should be updated: the version to
 // move to, whether this PC needs it, which of the connected PCs do, and
 // which of the other saved servers do.
+//
+// The version to move to is the newest one published for the chosen
+// channel. This PC's own version stands in when that is not known (or is
+// older), so servers can still be brought level with this PC, but only if
+// this PC's version belongs to the chosen channel.
 func updatePlan() (target string, client bool, live []liveServer, rest []savedServer) {
-	target = proto.Version
-	if r := latestRelease.Load(); r != nil && update.Newer(r.Version, target) {
-		target = r.Version
+	channel := releaseChannel.Load()
+	if own, ok := update.Parse(proto.Version); ok && own.Channel >= int(channel) {
+		target = proto.Version
+	}
+	if r := latestRelease.Load(); r != nil && r.channel == channel && (target == "" || update.Newer(r.rel.Version, target)) {
+		target = r.rel.Version
+	}
+	if target == "" {
+		return "", false, nil, nil
 	}
 	for _, tb := range tabs {
 		if l := tb.l; l != nil {
-			if v := l.version.Load(); v != nil && update.Newer(target, *v) {
+			if v := l.version.Load(); v != nil && update.Allowed(*v, target) {
 				live = append(live, liveServer{l, tb.target.name})
 			}
 		}
 	}
-	return target, update.Newer(target, proto.Version), live, behind(target)
+	return target, update.Allowed(proto.Version, target), live, behind(target)
 }
 
 // refreshUpdate shows or hides the Update button.
@@ -119,18 +156,39 @@ func refreshUpdate() {
 	if client {
 		count++
 	}
-	updateOffered = count > 0
+	// How many of those moves are to a newer version. The rest go back to
+	// an older one, which only happens when leaving Alpha or Beta: the
+	// button then says "Switch", and the window title stays quiet about it.
+	newer := 0
+	if client && update.Newer(target, proto.Version) {
+		newer++
+	}
+	for _, s := range live {
+		if v := s.l.version.Load(); v != nil && update.Newer(target, *v) {
+			newer++
+		}
+	}
+	for _, o := range rest {
+		if o.version == "" || update.Newer(target, o.version) {
+			newer++
+		}
+	}
+	updateOffered, updateNewer = count > 0, newer > 0
+	verb := "Update"
+	if newer < count {
+		verb = "Switch"
+	}
 	switch {
 	case count == 1 && client:
-		setText(hUpdate, "Update to version "+target)
+		setText(hUpdate, verb+" to version "+target)
 	case count == 1 && len(live) == 1:
-		setText(hUpdate, "Update the remote PC to "+target)
+		setText(hUpdate, verb+" the remote PC to "+target)
 	case count == 1:
-		setText(hUpdate, "Update 1 saved PC to "+target)
+		setText(hUpdate, verb+" 1 saved PC to "+target)
 	case count == 2 && client && len(live) == 1:
-		setText(hUpdate, "Update both PCs to "+target)
+		setText(hUpdate, verb+" both PCs to "+target)
 	case count > 1:
-		setText(hUpdate, "Update "+strconv.Itoa(count)+" PCs to "+target)
+		setText(hUpdate, verb+" "+strconv.Itoa(count)+" PCs to "+target)
 	}
 	enabled := uintptr(1)
 	if updating {
@@ -165,8 +223,8 @@ func startUpdate() {
 
 		updateProgress("Downloading version " + target + "...")
 		var rel update.Release
-		if r := latestRelease.Load(); r != nil && r.Version == target {
-			rel = *r
+		if r := latestRelease.Load(); r != nil && r.rel.Version == target {
+			rel = r.rel
 		} else {
 			var err error
 			if rel, err = update.ByVersion(ctx, target); err != nil {

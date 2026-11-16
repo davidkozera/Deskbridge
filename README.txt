@@ -71,6 +71,30 @@ UPDATING
   receive it over an ordinary connection, which takes the place of
   anyone else connected to them at that moment.
 
+  Release channels (More > Releases)
+    Mainline   finished versions. This is what every PC follows unless
+               you choose otherwise.
+    Beta       test versions that are nearly ready.
+    Alpha      experimental versions, where new features are tried
+               first. Expect faults.
+
+    The choice belongs to this client. After changing it, the Update
+    button offers to move this PC, the PCs it is connected to and the
+    other saved servers to the newest version of that channel. Nothing
+    changes until you click it. Alpha also takes a Beta or Mainline
+    version when that is the newest, and Beta takes a Mainline one.
+
+    To go back, choose Releases: Mainline and click the button, which
+    then reads "Switch ... to" the newest Mainline version. That is the
+    only case where a PC is moved to an older version; a PC on Mainline
+    is never moved back. If a remote PC can no longer be reached after
+    a test version, run the Mainline setup program on it.
+
+    Every PC must run 1.10.0 or later before it can take a Beta or
+    Alpha version, so update on Mainline first. If two clients set to
+    different channels use the same server, each offers to move it to
+    its own channel; choose the same channel on both.
+
   - Updates are only accepted if they carry the publisher's signature,
     so a tampered or unofficial setup program is refused on both PCs.
   - A server that was started by hand (not installed) cannot update

@@ -23,6 +23,7 @@ import (
 
 	"deskbridge/internal/mf"
 	"deskbridge/internal/proto"
+	"deskbridge/internal/update"
 	"deskbridge/internal/winclip"
 )
 
@@ -886,6 +887,7 @@ func saveSettings() {
 		"video=" + b(checked(hVideo)),
 		"fastcapture=" + b(checked(hFast)),
 		"remember=" + b(checked(hRemember)),
+		"channel=" + update.ChannelKey(int(releaseChannel.Load())),
 	}
 	// The tabs to open again next time, and the one in front.
 	var open []string
@@ -951,6 +953,8 @@ func loadSettings() {
 			}
 		case "remember":
 			setChecked(hRemember, v == "1")
+		case "channel":
+			releaseChannel.Store(int32(update.ChannelFromKey(v)))
 		case "open":
 			launchTabsKnown = true
 			if v != "" {
