@@ -1,0 +1,112 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "The Deskbridge relay on Azure Container Apps: one small container that Deskbridge servers and clients connect out to, so a PC can be reached from another network without opening any ports. See INTERNET in README.txt."
+  },
+  "parameters": {
+    "name": {
+      "type": "string",
+      "defaultValue": "deskbridge-relay",
+      "minLength": 2,
+      "maxLength": 32,
+      "metadata": {
+        "description": "Name of the container app. It becomes the first part of the relay's web address."
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Azure region. Left alone, it is the resource group's region."
+      }
+    },
+    "image": {
+      "type": "string",
+      "defaultValue": "ghcr.io/davidkozera/deskbridge-relay:alpha",
+      "metadata": {
+        "description": "The relay's container image. It must be publicly readable."
+      }
+    },
+    "relayKey": {
+      "type": "securestring",
+      "defaultValue": "[replace(newGuid(), '-', '')]",
+      "minLength": 16,
+      "maxLength": 200,
+      "metadata": {
+        "description": "Who may use the relay. Leave it alone to have a random key made, or enter 16 or more letters and digits (no spaces). The finished deployment shows it as part of the relay code, under Outputs."
+      }
+    }
+  },
+  "variables": {
+    "environmentName": "[concat(parameters('name'), '-env')]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.App/managedEnvironments",
+      "apiVersion": "2024-03-01",
+      "name": "[variables('environmentName')]",
+      "location": "[parameters('location')]",
+      "properties": {}
+    },
+    {
+      "type": "Microsoft.App/containerApps",
+      "apiVersion": "2024-03-01",
+      "name": "[parameters('name')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]"
+      ],
+      "properties": {
+        "environmentId": "[resourceId('Microsoft.App/managedEnvironments', variables('environmentName'))]",
+        "configuration": {
+          "activeRevisionsMode": "Single",
+          "secrets": [
+            {
+              "name": "relay-key",
+              "value": "[parameters('relayKey')]"
+            }
+          ],
+          "ingress": {
+            "external": true,
+            "targetPort": 8080,
+            "transport": "auto",
+            "allowInsecure": false
+          }
+        },
+        "template": {
+          "containers": [
+            {
+              "name": "relay",
+              "image": "[parameters('image')]",
+              "env": [
+                {
+                  "name": "DESKBRIDGE_RELAY_KEY",
+                  "secretRef": "relay-key"
+                }
+              ],
+              "resources": {
+                "cpu": "[json('0.25')]",
+                "memory": "0.5Gi"
+              }
+            }
+          ],
+          "scale": {
+            "minReplicas": 1,
+            "maxReplicas": 1
+          }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "relayAddress": {
+      "type": "string",
+      "value": "[concat('https://', reference(resourceId('Microsoft.App/containerApps', parameters('name'))).configuration.ingress.fqdn)]"
+    },
+    "relayCode": {
+      "type": "string",
+      "value": "[concat('https://', reference(resourceId('Microsoft.App/containerApps', parameters('name'))).configuration.ingress.fqdn, '#', parameters('relayKey'))]"
+    }
+  }
+}

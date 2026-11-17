@@ -54,9 +54,17 @@ INTERNET (Alpha versions only, for now)
   In this version the whole session travels through the relay. A later
   one will let the two PCs talk directly after being introduced.
 
-  1. Set up the relay, once. It is a small container; these commands
-     run it on Azure Container Apps. Paste them into Azure Cloud Shell
-     (the >_ button at portal.azure.com, Bash):
+  1. Set up the relay, once. It is a small container that runs on
+     Azure Container Apps.
+
+     The quick way: on the project's GitHub page, switch to the alpha
+     branch and click the "Deploy to Azure" button. Choose a
+     subscription, a resource group and a region, click Review + create
+     and then Create. When it has finished, open Outputs on the
+     deployment and copy relayCode.
+
+     Or by hand: paste these commands into Azure Cloud Shell (the >_
+     button at portal.azure.com, Bash):
 
        RG=deskbridge
        LOC=canadacentral
