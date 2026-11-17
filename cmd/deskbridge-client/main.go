@@ -246,6 +246,8 @@ type link struct {
 	relayed   bool                   // it goes through the relay rather than straight to the server
 	relayInfo atomic.Pointer[string] // "id\naddress": how the server says it can be reached through a relay
 	relayTold bool                   // UI thread: this client has told it which relay to use
+	linkKbit  atomic.Int64           // what the server measured the connection to carry, 0 if it showed no limit
+	linkMs    atomic.Int32           // and its round trip, 0 until measured
 	pong      atomic.Bool            // the server answers pings, so silence means the link is dead
 
 	// The remote screen. Decoders writing disjoint areas share the read
@@ -770,11 +772,24 @@ func refreshVersionLine() {
 		line += "   |   " + strconv.Itoa(measuredFPS) + " fps"
 	}
 	// The last line: how the connection in front reaches its PC.
+	// With what the server has measured: the speed, if the connection
+	// turned out slower than a local network (the picture is then sized to
+	// fit it), and the round trip.
 	switch l := cur.Load(); {
-	case l != nil && l.relayed:
-		line += "\r\nOver the internet, through the relay"
 	case l != nil:
-		line += "\r\nOn the local network"
+		how := "Local network"
+		if l.relayed {
+			how = "Internet (relay)"
+		}
+		if k := l.linkKbit.Load(); k >= 10000 {
+			how += " | " + strconv.FormatInt(k/1000, 10) + " Mbit/s"
+		} else if k > 0 {
+			how += " | " + strconv.FormatFloat(float64(k)/1000, 'f', 1, 64) + " Mbit/s"
+		}
+		if ms := l.linkMs.Load(); ms > 0 {
+			how += " | " + strconv.Itoa(int(ms)) + " ms"
+		}
+		line += "\r\n" + how
 	case relayAddress != "":
 		line += "\r\nInternet access: on"
 	}
@@ -1318,6 +1333,11 @@ func receiver(l *link) {
 				l.controller.Store(&name)
 				l.inControl.Store(p[0] == 1)
 				pPostMessage.Call(hMain, wmControl, l.id, 0)
+			}
+		case proto.MsgLinkInfo:
+			if len(p) >= 6 {
+				l.linkKbit.Store(int64(binary.LittleEndian.Uint32(p)))
+				l.linkMs.Store(int32(binary.LittleEndian.Uint16(p[4:])))
 			}
 		case proto.MsgRelayInfo:
 			if len(p) <= 400 {

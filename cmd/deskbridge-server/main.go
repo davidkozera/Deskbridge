@@ -23,6 +23,7 @@ import (
 	"time"
 	"unsafe"
 
+	"deskbridge/internal/pace"
 	"deskbridge/internal/proto"
 	"deskbridge/internal/winclip"
 )
@@ -83,6 +84,7 @@ var workerMode bool
 type session struct {
 	c           *proto.Conn
 	pending     atomic.Int32
+	link        pace.Meter   // how much the connection carries, learned from acknowledgements
 	fps         atomic.Int32 // these three can be changed live by the client
 	quality     atomic.Int32
 	audioOn     atomic.Bool
@@ -553,6 +555,7 @@ func inputLoop(s *session, peer clipPeer) {
 		switch t {
 		case proto.MsgAck:
 			s.pending.Add(-1)
+			s.link.Acked(time.Now())
 		case proto.MsgSettings:
 			if len(p) < 4 {
 				continue
@@ -726,7 +729,14 @@ func videoLoop(s *session) {
 	var prev []byte
 	vid := newMotionVideo(s)
 	defer vid.close()
-	recheck := false        // compare with the last frame even if the screen has not changed
+	recheck := false // compare with the last frame even if the screen has not changed
+	// For a link slower than a local network (see internal/pace): tiles
+	// knowingly left unsent, to follow in the next frames; how many bytes a
+	// pixel of tiles has been coming to; what the client was last told.
+	owed := map[[2]int]struct{}{}
+	perPixel := 0.25
+	var toldLink []byte
+	var toldLinkAt time.Time
 	toldFast := false       // which capture method the client was last told about
 	var toldMonitors []byte // the display list the client was last sent
 	s.c.Send(proto.MsgNotice, false, append([]byte{proto.NoticeVersion}, proto.Version...))
@@ -741,13 +751,25 @@ func videoLoop(s *session) {
 			log.Print("client stopped answering; closing the connection")
 			return
 		}
-		if s.pending.Load() >= 2 {
+		interval := time.Second / time.Duration(min(max(s.fps.Load(), 1), 120))
+		// Two frames on their way at once, or a few more when the round
+		// trip is long.
+		if s.pending.Load() >= s.link.Window(interval) {
 			time.Sleep(2 * time.Millisecond)
 			continue
 		}
 		start := time.Now()
-		interval := time.Second / time.Duration(min(max(s.fps.Load(), 1), 120))
 		quality := int(min(max(s.quality.Load(), 1), 100))
+		if start.Sub(toldLinkAt) >= 2*time.Second {
+			toldLinkAt = start
+			rate, roundTrip := s.link.Info()
+			info := binary.LittleEndian.AppendUint32(nil, uint32(rate/1000))
+			info = binary.LittleEndian.AppendUint16(info, uint16(min(roundTrip/time.Millisecond, 60000)))
+			if !bytes.Equal(info, toldLink) {
+				toldLink = info
+				s.c.Send(proto.MsgLinkInfo, false, info)
+			}
+		}
 		desk.sync(c.free) // freeing forces a fresh capture surface and a full frame
 		choice := int(s.monitor.Load())
 		if desk.name != "" && !strings.EqualFold(desk.name, "Default") {
@@ -839,12 +861,26 @@ func videoLoop(s *session) {
 			rects = proto.DirtyRects(c.pix, prev, c.w, c.h, 64)
 			recheck = false
 		}
-		switch vid.decide(rects, c.w, c.h, prev == nil, interval, quality) {
+		// How much changed, leaving out what is only waiting its turn to
+		// be sent: that is not motion.
+		area := 0
+		for _, r := range rects {
+			for x := r.X; x < r.X+r.W; x += tile {
+				if _, waiting := owed[[2]int{x / tile, r.Y / tile}]; !waiting {
+					area += min(tile, r.X+r.W-x) * r.H
+				}
+			}
+		}
+		switch vid.decide(area, c.w, c.h, prev == nil, interval, quality) {
 		case leaveVideo:
+			for t := range vid.touched {
+				owed[t] = struct{}{}
+			}
 			vid.markForRedraw(prev, c.w) // the next pass redraws, crisply, what video drew
 			recheck = true               // even if the screen itself does not change again
 			continue
 		case useVideo:
+			clear(owed) // video draws the whole picture
 			if len(rects) > 0 {
 				sent, err := vid.send(c.pix, c.w, rects)
 				if err != nil {
@@ -856,6 +892,7 @@ func videoLoop(s *session) {
 				}
 				copy(prev, c.pix)
 				if sent {
+					s.link.Sent(vid.wroteAt, vid.wroteBytes)
 					s.pending.Add(1)
 					if s.c.Send(proto.MsgFrameEnd, true) != nil {
 						return
@@ -867,11 +904,29 @@ func videoLoop(s *session) {
 			}
 			continue
 		}
+		clear(owed)
 		if len(rects) > 0 {
 			type enc struct {
 				kind byte
 				data []byte
 			}
+			// On a slow link a large change goes in pieces, each small
+			// enough to cross in about a tenth of a second, top of the
+			// screen first. The rest stays marked as changed and follows in
+			// the next frames, so the picture keeps moving and the pointer
+			// and keyboard stay responsive, where one huge frame would
+			// hold everything up until it had arrived.
+			all := rects
+			budget := s.link.Budget()
+			if budget > 0 {
+				n, guess := 0, 0.0
+				for n < len(rects) && (n == 0 || guess < float64(budget)) {
+					guess += float64(rects[n].W*rects[n].H) * perPixel
+					n++
+				}
+				rects = rects[:n]
+			}
+			tileQuality := s.link.Quality(quality)
 			out := make([]enc, len(rects))
 			var wg sync.WaitGroup
 			for i, r := range rects {
@@ -879,13 +934,30 @@ func videoLoop(s *session) {
 				sem <- struct{}{}
 				go func() {
 					defer func() { <-sem; wg.Done() }()
-					out[i].kind, out[i].data = proto.EncodeRect(c.pix, c.w, r, quality)
+					out[i].kind, out[i].data = proto.EncodeRect(c.pix, c.w, r, tileQuality)
 				}()
 			}
 			wg.Wait()
+			size, pixels := 0, 0
+			for i, r := range rects {
+				if budget > 0 && i > 0 && int64(size) >= budget*5/4 {
+					rects, out = rects[:i], out[:i] // the guess was too low
+					break
+				}
+				size += len(out[i].data)
+				pixels += r.W * r.H
+			}
+			perPixel = min(max(perPixel+0.3*(float64(size)/float64(max(pixels, 1))-perPixel), 0.005), 3)
 			if prev == nil {
+				// All of it counts as sent, then what was held back is
+				// marked as still to send.
 				prev = make([]byte, len(c.pix))
 				copy(prev, c.pix)
+				for _, r := range all[len(rects):] {
+					for x := r.X; x < r.X+r.W; x += tile {
+						prev[(r.Y*c.w+x)*4] ^= 0xFF
+					}
+				}
 			} else {
 				for _, r := range rects {
 					for y := r.Y; y < r.Y+r.H; y++ {
@@ -894,6 +966,15 @@ func videoLoop(s *session) {
 					}
 				}
 			}
+			if len(rects) < len(all) {
+				for _, r := range all[len(rects):] {
+					for x := r.X; x < r.X+r.W; x += tile {
+						owed[[2]int{x / tile, r.Y / tile}] = struct{}{}
+					}
+				}
+				recheck = true // even if the screen itself does not change again
+			}
+			wrote, before := time.Now(), s.c.Sent()
 			for i, r := range rects {
 				hdr := make([]byte, 9)
 				binary.LittleEndian.PutUint16(hdr[0:], uint16(r.X))
@@ -905,6 +986,7 @@ func videoLoop(s *session) {
 					return
 				}
 			}
+			s.link.Sent(wrote, s.c.Sent()-before)
 			s.pending.Add(1)
 			if s.c.Send(proto.MsgFrameEnd, true) != nil {
 				return

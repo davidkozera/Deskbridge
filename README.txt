@@ -106,9 +106,21 @@ INTERNET (Alpha versions only, for now)
   From then on, opening a saved connection tries the PC's own address
   first. If that has not answered within a second and a half, the relay
   is tried as well, and whichever answers is used (the PC's own address
-  if both do). The bottom of the pane says which: "On the local
-  network" or "Over the internet, through the relay". Checking and
+  if both do). The bottom of the pane says which: "Local network" or
+  "Internet (relay)". Checking and
   updating saved servers works through the relay in the same way.
+
+  Speed: away from home, the limit is usually the upload speed of the
+  remote PC's internet connection, which is far below a local network.
+  The server measures what the connection carries and fits the picture
+  to it: a large change is sent in pieces, top of the screen first,
+  photographs are compressed a little harder, and video for motion
+  starts sooner and at a bit rate the connection can take. The bottom
+  of the pane shows what was measured, for example
+  "Internet (relay) | 14 Mbit/s | 85 ms". No speed is shown while the
+  connection has not been seen to hold anything up, as on a local
+  network, where nothing changes. "Video for motion" makes the biggest
+  difference on a slow connection; keep it ticked.
 
   - Only saved connections are set up this way, and each client needs
     the relay code. Every client should use the same one: a server

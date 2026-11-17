@@ -86,7 +86,10 @@ type motionVideo struct {
 	warm      chan warmResult
 
 	touched map[[2]int]struct{} // screen tiles drawn by video since the last crisp redraw
-	areas   []proto.Rect        // changed areas not yet sent along with a frame
+
+	wroteAt    time.Time    // when the last frame sent began to be written, and
+	wroteBytes int64        // its size: for measuring the link (see internal/pace)
+	areas      []proto.Rect // changed areas not yet sent along with a frame
 }
 
 func newMotionVideo(s *session) *motionVideo {
@@ -115,6 +118,10 @@ func (m *motionVideo) want(w, h int, interval time.Duration, quality int) (encod
 			rate = 60 * math.Sqrt(rate/60)
 		}
 		k.bitrate = int(min(max(float64(k.w*k.h)*rate*bpp, 2e6), 80e6))
+		// A link slower than that gets what it can carry.
+		if ceiling := m.s.link.VideoCap(time.Now()); ceiling > 0 {
+			k.bitrate = min(k.bitrate, ceiling)
+		}
 		return k, true
 	}
 	return encoderKey{}, false
@@ -171,9 +178,13 @@ func (m *motionVideo) ready(key encoderKey) bool {
 	return m.enc != nil
 }
 
-// decide looks at how much of the screen changed and says how this frame
-// should be sent. fresh means a full redraw is due anyway.
-func (m *motionVideo) decide(rects []proto.Rect, w, h int, fresh bool, interval time.Duration, quality int) int {
+// decide looks at how much of the screen changed (area, in pixels) and says
+// how this frame should be sent. fresh means a full redraw is due anyway.
+//
+// On a slow link video starts sooner and for smaller changes: a moving
+// picture costs far less as video than as freshly drawn tiles, and there
+// the difference is between following the motion and falling behind it.
+func (m *motionVideo) decide(area, w, h int, fresh bool, interval time.Duration, quality int) int {
 	if m.s.restart.Swap(false) {
 		m.dropEncoder() // the next video frame starts a new stream the client can pick up
 	}
@@ -192,21 +203,21 @@ func (m *motionVideo) decide(rects []proto.Rect, w, h int, fresh bool, interval 
 		m.areas = nil
 		return useTiles
 	}
-	area := 0
-	for _, r := range rects {
-		area += r.W * r.H
-	}
 	frac := float64(area) / float64(max(w*h, 1))
+	enterAt, enterWait := enterFraction, enterAfter
+	if m.s.link.Limited() {
+		enterAt, enterWait = 0.06, 100*time.Millisecond
+	}
 
 	if !m.active {
-		if frac < enterFraction {
+		if frac < enterAt {
 			m.heavySince = time.Time{}
 			return useTiles
 		}
 		if m.heavySince.IsZero() {
 			m.heavySince = now
 		}
-		if !ready || now.Sub(m.heavySince) < enterAfter {
+		if !ready || now.Sub(m.heavySince) < enterWait {
 			return useTiles
 		}
 		m.active, m.heavySince, m.quietSince = true, time.Time{}, time.Time{}
@@ -256,6 +267,7 @@ func (m *motionVideo) send(pix []byte, pixW int, rects []proto.Rect) (bool, erro
 		m.active = false
 		return false, err
 	}
+	m.wroteAt, m.wroteBytes = time.Now(), 0
 	for _, p := range pkts {
 		hdr := make([]byte, 8, 8+8*len(m.areas))
 		if p.Key {
@@ -275,6 +287,7 @@ func (m *motionVideo) send(pix []byte, pixW int, rects []proto.Rect) (bool, erro
 			}
 		}
 		m.areas = m.areas[:0] // sent with the first frame; later ones add nothing
+		m.wroteBytes += int64(len(hdr) + len(p.Data) + 5)
 		if err := m.s.c.Send(proto.MsgVideo, false, hdr, p.Data); err != nil {
 			return false, err
 		}

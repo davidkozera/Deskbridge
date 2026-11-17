@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,6 +30,7 @@ const (
 	MsgPong         = 11 // the answer to MsgPing
 	MsgPointer      = 13 // x u16, y u16, visible u8: where the remote pointer is on the picture, for a client that is not the one moving it
 	MsgControl      = 14 // u8 (1: this client is in control of the mouse and keyboard; 0: it is not), then the name of the PC that is
+	MsgLinkInfo     = 45 // u32 kbit/s the link carries (0: no limit seen), u16 round trip in ms (see internal/pace)
 	MsgRelayInfo    = 15 // "id\naddress": this server's ID at its relay and the relay's address, or "\n" if it uses none (see internal/relay)
 	MsgModes        = 12 // current w u16, h u16, count u8, then that many (w u16, h u16): resolutions the shown display supports
 )
@@ -83,11 +85,15 @@ const (
 const maxMsg = 64 << 20
 
 type Conn struct {
-	nc net.Conn
-	r  *bufio.Reader
-	mu sync.Mutex
-	w  *bufio.Writer
+	nc   net.Conn
+	r    *bufio.Reader
+	mu   sync.Mutex
+	w    *bufio.Writer
+	sent atomic.Int64
 }
+
+// Sent is how many bytes of messages have been handed over for sending.
+func (c *Conn) Sent() int64 { return c.sent.Load() }
 
 func NewConn(nc net.Conn) *Conn {
 	return &Conn{nc: nc, r: bufio.NewReaderSize(nc, 256<<10), w: bufio.NewWriterSize(nc, 256<<10)}
@@ -104,6 +110,7 @@ func (c *Conn) Send(t byte, flush bool, parts ...[]byte) error {
 	binary.LittleEndian.PutUint32(hdr[1:], uint32(n))
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.sent.Add(int64(n) + 5)
 	c.nc.SetWriteDeadline(time.Now().Add(15 * time.Second))
 	if _, err := c.w.Write(hdr[:]); err != nil {
 		return err
